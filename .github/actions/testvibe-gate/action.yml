@@ -1,0 +1,45 @@
+name: testvibe-gate
+description: >-
+  Reusable S0 pre-merge CI gate for testvibe — installs dev deps, runs ruff +
+  mypy, then the hermetic test subset (live/dogfood quarantined, benchmarks
+  disabled) with tool-specific env vars scrubbed so the gate matches CI reality
+  rather than the dev shell (the SYNCESTRA_* leak class).
+
+inputs:
+  scrub-env:
+    description: >-
+      Env-var prefix to scrub from the gate run (e.g. "SYNCESTRA_"). Every
+      variable whose name starts with this prefix is unset before the test step
+      runs, so a leftover dev-shell secret cannot cause a false gate failure.
+    type: string
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install dev dependencies
+      shell: bash
+      run: uv sync --extra dev
+
+    - name: Lint (ruff)
+      shell: bash
+      run: ruff check .
+
+    - name: Type-check (mypy)
+      shell: bash
+      run: mypy
+
+    - name: Scrub tool-specific env and run the hermetic suite
+      shell: bash
+      env:
+        # Expand the scrub-env input into a var the step can read.
+        TESTVIBE_SCRUB_ENV: ${{ inputs.scrub-env }}
+      run: |
+        # Drop any env var whose name starts with the configured prefix so the
+        # gate matches CI reality, not the dev shell (mirrors `env -u PREFIX_*`).
+        if [ -n "$TESTVIBE_SCRUB_ENV" ]; then
+          for var in $(compgen -v | grep "^$TESTVIBE_SCRUB_ENV" || true); do
+            unset "$var"
+          done
+        fi
+        pytest -m "not live and not dogfood" --benchmark-disable
