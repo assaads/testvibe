@@ -69,6 +69,18 @@ def test_analyze_smell_patterns():
     assert len(smells) == 3  # TODO, FIXME, hack
 
 
+def test_analyze_smell_matches_deprecation_warning():
+    """``DeprecationWarning`` is Python's canonical deprecation signal and must
+    be flagged as a smell (regression guard on the smell regex).
+    """
+    transcript = "DeprecationWarning: use baz() instead"
+    advisories = analyze(
+        [], baseline=1000, fixture_paths=[], touched_paths=[], transcript=transcript
+    )
+    smells = [a for a in advisories if a.kind == "smell"]
+    assert len(smells) == 1
+
+
 def test_analyze_coverage_gap():
     fixture_paths = ["a.py", "b.py"]
     touched_paths = ["a.py", "b.py", "c.py", "d.py"]
@@ -87,19 +99,31 @@ def test_analyze_coverage_gap():
 
 
 def test_analyze_makes_no_network_call(monkeypatch):
-    """analyze must be data-only: monkeypatch urlopen to raise; analyze still succeeds."""
+    """analyze is data-only: it must not open ANY socket or URL.
 
-    def _no_network(*a, **k):
-        raise AssertionError("advisory.analyze must not make any network call")
+    Guards two egress vectors so a future regression cannot slip in via a
+    different network library than urllib:
 
+    (1) dynamic  — monkeypatch ``socket.socket`` to raise on construction AND
+                   ``urllib.request.urlopen`` to raise; ``analyze`` still
+                   returns its advisories without raising.
+    (2) static   — ``advisory.py``'s own source must import no network module
+                   (``socket``/``urllib``/``http``/``requests``/``urllib3``/``ssl``),
+                   catching the regression at the source regardless of how the
+                   call is made.
+    """
+    # --- (1) dynamic guards: any socket construction or URL open blows up. ---
+    import socket
     import urllib.request
 
-    monkeypatch.setattr(urllib.request, "urlopen", _no_network)
-    # Also patch the module-level urllib if advisory imported it.
-    import testvibe.advisory as adv_mod
+    def _no_socket(*a, **k):
+        raise AssertionError("advisory.analyze must not open any socket")
 
-    if hasattr(adv_mod, "urllib"):
-        monkeypatch.setattr(adv_mod.urllib.request, "urlopen", _no_network)
+    def _no_urlopen(*a, **k):
+        raise AssertionError("advisory.analyze must not open any URL")
+
+    monkeypatch.setattr(socket, "socket", _no_socket)
+    monkeypatch.setattr(urllib.request, "urlopen", _no_urlopen)
 
     report = [_op("push", p90_ms=5000, passed=True)]
     advisories = analyze(
@@ -109,8 +133,26 @@ def test_analyze_makes_no_network_call(monkeypatch):
         touched_paths=["a", "b"],
         transcript="Deprecated: x\n",
     )
-    # Must return results without calling urlopen.
+    # Must return results without opening any socket / URL.
     assert len(advisories) >= 3
+
+    # --- (2) static guard: advisory.py imports no network module. ---
+    import inspect
+    import re as _re
+
+    import testvibe.advisory as adv_mod
+
+    source = inspect.getsource(adv_mod)
+    forbidden = {"socket", "urllib", "http", "requests", "urllib3", "ssl"}
+    imported = set()
+    for line in source.splitlines():
+        m = _re.match(r"\s*(?:from|import)\s+([A-Za-z_][A-Za-z0-9_]*)", line)
+        if m:
+            imported.add(m.group(1))
+    network_imports = imported & forbidden
+    assert not network_imports, (
+        f"advisory.py must not import network modules; found: {sorted(network_imports)}"
+    )
 
 
 def test_advisory_is_dataclass():

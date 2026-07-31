@@ -113,6 +113,8 @@ def assert_no_regression(
 
     The check **clears** (does not raise) when RSS is rising across samples
     (work is progressing, memory growing) or when CPU is not sustained high.
+    Fewer than two samples cannot demonstrate a *sustained* spin, so the check
+    also clears for empty / single-sample input.
 
     Parameters:
 
@@ -120,7 +122,7 @@ def assert_no_regression(
     * ``flat_rss_eps_mb``  — RSS range (max - min) at or below which RSS counts
       as "flat".
     """
-    if not samples:
+    if len(samples) < 2:
         return
     cpu_values = [s[0] for s in samples]
     rss_values = [s[1] for s in samples]

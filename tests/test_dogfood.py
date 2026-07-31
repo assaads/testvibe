@@ -71,6 +71,13 @@ def test_no_regression_empty_samples_clears():
     assert_no_regression([], cpu_pct=50, flat_rss_eps_mb=8)  # must not raise
 
 
+def test_no_regression_single_sample_clears():
+    """A single high-CPU sample cannot demonstrate a *sustained* spin, so it
+    must not raise (false-positive guard on the RC5 spin signature).
+    """
+    assert_no_regression([(90.0, 100.0)], cpu_pct=50, flat_rss_eps_mb=8)  # must not raise
+
+
 # --- assert_empty_diff ---
 
 

@@ -24,8 +24,13 @@ from typing import Any
 __all__ = ["Advisory", "analyze"]
 
 # Transcript lines that smell like tech debt / deprecation. Word-bounded so
-# ordinary prose containing "fix" or "to do" is not flagged.
-_SMELL_RE = re.compile(r"\b(deprecat(?:ed|ion)?|TODO|FIXME|HACK|XXX)\b", re.IGNORECASE)
+# ordinary prose containing "fix" or "to do" is not flagged. The deprecation
+# branch (``deprecat\w*``) matches ``DeprecationWarning``, ``deprecated``,
+# ``deprecation``, and ``deprecate``; the trailing ``\b`` sits after a run of
+# word chars so it lands on a real token boundary (the old ``(?:ed|ion)?\b``
+# left ``DeprecationWarning`` un-matched because ``n`` and ``W`` are both word
+# chars — no boundary between them).
+_SMELL_RE = re.compile(r"\b(deprecat\w*|TODO|FIXME|HACK|XXX)\b", re.IGNORECASE)
 
 
 @dataclass
