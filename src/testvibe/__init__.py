@@ -1,5 +1,5 @@
 """testvibe — scenario-driven, agent-driven real-usage testing for any tool."""
 
-from testvibe.scenario import invariant, scenario  # noqa: F401
+from testvibe.scenario import invariant, scenario
 
-__all__ = ["scenario", "invariant"]
+__all__ = ["invariant", "scenario"]

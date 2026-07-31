@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import io
 import sys
-from typing import Type
 
 from hypothesis import HealthCheck, settings
 from hypothesis.stateful import RuleBasedStateMachine, run_state_machine_as_test
@@ -32,7 +31,7 @@ class TestvibeStateMachine(RuleBasedStateMachine):
 
 
 def run_fuzz(
-    model_cls: Type[RuleBasedStateMachine],
+    model_cls: type[RuleBasedStateMachine],
     *,
     max_examples: int,
     step_count: int,

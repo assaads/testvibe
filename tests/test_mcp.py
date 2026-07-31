@@ -11,8 +11,6 @@ mutated. No tool actually subprocesses pytest here.
 import asyncio
 import json
 
-import pytest
-
 
 # fastmcp v2 exposes registered tools via ``await server.list_tools()``; each
 # returned Tool object carries a ``.name``. This is the public, stable surface.
@@ -48,7 +46,7 @@ def test_mcp_exposes_engine_tools():
 
     s = build_server(contract_path=None)
     names = asyncio.run(_tool_names(s))
-    assert EXPECTED_TOOLS <= names, (
+    assert names >= EXPECTED_TOOLS, (
         f"missing tools: {EXPECTED_TOOLS - names}; have {sorted(names)}"
     )
 

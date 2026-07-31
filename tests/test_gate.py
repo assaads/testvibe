@@ -72,7 +72,10 @@ def test_scrub_env_default_env_is_os_environ_copy(monkeypatch):
 # composite action contract
 # --------------------------------------------------------------------------- #
 def _action_path() -> pathlib.Path:
-    return pathlib.Path(__file__).resolve().parents[1] / ".github" / "actions" / "testvibe-gate" / "action.yml"
+    return (
+        pathlib.Path(__file__).resolve().parents[1]
+        / ".github" / "actions" / "testvibe-gate" / "action.yml"
+    )
 
 
 def test_composite_action_yaml_parses_and_is_composite():

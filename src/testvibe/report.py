@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
-from typing import List
+from typing import Any
 
 __all__ = ["Failure", "RunReport", "redact"]
 
@@ -24,18 +25,20 @@ _REDACTED = "***REDACTED***"
 
 # Defensively import detect-secrets' line scanner. If the scanner API is
 # unavailable (older/newer detect-secrets, or a stripped build), redaction
-# falls back to the regex backstop above.
-_ds_scan_line = None
+# falls back to the regex backstop above. The explicit annotation makes the
+# optional-import pattern type-check cleanly (local name is the union, not
+# ``object`` inferred from the ``None`` fallback).
+_ds_scan_line: Callable[[str], Generator[Any, None, None]] | None = None
 try:  # pragma: no cover - import guard
     from detect_secrets.core.scan import scan_line as _ds_scan_line
-except Exception:  # noqa: BLE001 - any import failure -> regex fallback
+except Exception:
     _ds_scan_line = None
 
 
 def _regex_mask(text: str) -> str:
     """Mask well-known token prefixes defensively."""
 
-    def _sub(match: "re.Match[str]") -> str:
+    def _sub(match: re.Match[str]) -> str:
         return f"{match.group(1)}{_REDACTED}"
 
     return _SECRET_PREFIX_RE.sub(_sub, text)
@@ -61,7 +64,7 @@ def redact(text: str) -> str:
                     value = getattr(finding, "secret_value", None)
                     if value:
                         secrets.add(value)
-        except Exception:  # noqa: BLE001 - never let redaction crash the report
+        except Exception:
             secrets = set()
         for secret in secrets:
             if secret and len(secret) >= 4:
@@ -98,8 +101,8 @@ class RunReport:
     tool: str
     run: str
     passed: bool
-    failures: List[Failure] = field(default_factory=list)
-    advisories: List[str] = field(default_factory=list)
+    failures: list[Failure] = field(default_factory=list)
+    advisories: list[str] = field(default_factory=list)
 
     def add_failure(self, failure: Failure) -> None:
         """Record a failure (infra or product)."""

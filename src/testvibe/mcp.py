@@ -32,11 +32,9 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-
 from fastmcp import FastMCP
 
 from . import advisory
-from .corpus import load_corpus
 from .report import Failure, RunReport
 
 __all__ = ["build_server"]
@@ -129,9 +127,6 @@ def build_server(
     )
     cfg_fixtures = _coerce_str_list(fixture_paths, contract, "fixture_paths")
     cfg_touched = _coerce_str_list(touched_paths, contract, "touched_paths")
-    cfg_transcript = transcript if transcript is not None else (
-        contract.get("transcript") or ""
-    )
     if baseline is None:
         contract_baseline = contract.get("baseline")
         cfg_baseline = (

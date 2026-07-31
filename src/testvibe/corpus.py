@@ -76,24 +76,26 @@ def load_corpus(path) -> list[CorpusEntry]:
         )
 
     entries: list[CorpusEntry] = []
-    for i, e in enumerate(raw):
-        if not isinstance(e, dict):
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
             raise CorpusError(
-                f"entry #{i} in {p} is not a mapping (got {type(e).__name__})"
+                f"entry #{i} in {p} is not a mapping (got {type(entry).__name__})"
             )
         # Filter by status BEFORE validating completeness, so legacy fixed /
         # ignored entries with missing fields don't poison the whole load.
-        if e.get("status") not in ("open", "pinned"):
+        if entry.get("status") not in ("open", "pinned"):
             continue
-        missing = [f for f in _REQUIRED_FIELDS if f not in e]
+        missing = [f for f in _REQUIRED_FIELDS if f not in entry]
         if missing:
             raise CorpusError(
-                f"entry #{i} in {p} (id={e.get('id')!r}) missing fields: {missing}"
+                f"entry #{i} in {p} (id={entry.get('id')!r}) missing fields: {missing}"
             )
         try:
-            entries.append(CorpusEntry(**e))
+            entries.append(CorpusEntry(**entry))
         except TypeError as ex:
-            raise CorpusError(f"entry #{i} in {p} (id={e.get('id')!r}) invalid: {ex}") from ex
+            raise CorpusError(
+                f"entry #{i} in {p} (id={entry.get('id')!r}) invalid: {ex}"
+            ) from ex
     return entries
 
 

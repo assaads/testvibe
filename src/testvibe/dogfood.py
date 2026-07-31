@@ -37,7 +37,7 @@ def _read_vmrss_mb() -> float:
     missing procfs.
     """
     try:
-        with open("/proc/self/status", "r") as fh:
+        with open("/proc/self/status") as fh:
             for line in fh:
                 if line.startswith("VmRSS:"):
                     # "VmRSS:\t   12345 kB"

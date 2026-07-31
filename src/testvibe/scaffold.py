@@ -137,11 +137,14 @@ def _splice_kept(new_content: str, kept: dict[str, str]) -> str:
                 r"(^# end testvibe:keep)",
                 re.MULTILINE | re.DOTALL,
             )
-            new_content, _ = pattern.subn(
-                lambda m, body=body: m.group(1) + body + m.group(2),
-                new_content,
-                count=1,
-            )
+            # Splice the kept block body into the slot's keep marker. ``body``
+            # is bound as a default arg so each iteration captures its own value
+            # (avoids late-binding closures); the explicit ``re.Match[str]``
+            # annotation lets mypy infer the lambda/def return type cleanly.
+            def _splice(m: re.Match[str], body: str = body) -> str:
+                return m.group(1) + body + m.group(2)
+
+            new_content, _ = pattern.subn(_splice, new_content, count=1)
         else:
             # Orphan: append so user code is never dropped.
             new_content = new_content.rstrip("\n") + "\n"

@@ -11,7 +11,7 @@ via the scheduler/MCP, not during a default local pytest run).
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 # Registries populated by the decorators. Other goals (report/CI) may read
 # these to enumerate known scenarios/invariants.
@@ -44,7 +44,14 @@ def scenario(
 
     def deco(fn: Callable) -> Callable:
         fn = pytest.mark.testvibe_scenario(fn)
-        fn.__testvibe__ = {"name": name, "kind": kind, "surfaces": tuple(surfaces)}
+        # ``__testvibe__`` is a dynamic marker attribute that pytest/the plugin
+        # read back to identify testvibe scenarios. It is deliberately dynamic
+        # (no fixed attribute on ``Callable``), hence the scoped ignore.
+        fn.__testvibe__ = {  # type: ignore[attr-defined]
+            "name": name,
+            "kind": kind,
+            "surfaces": tuple(surfaces),
+        }
         SCENARIOS[name] = {"fn": fn, "kind": kind, "surfaces": tuple(surfaces)}
         if kind != "hermetic":
             fn = pytest.mark.skip(reason=f"{kind} scenario; run via scheduler/MCP")(fn)
@@ -58,7 +65,8 @@ def invariant(name: str):
 
     def deco(fn: Callable) -> Callable:
         INVARIANTS[name] = fn
-        fn.__testvibe_invariant__ = name
+        # Dynamic marker attribute (see ``scenario`` above).
+        fn.__testvibe_invariant__ = name  # type: ignore[attr-defined]
         return fn
 
     return deco
