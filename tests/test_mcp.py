@@ -9,6 +9,7 @@ mutated. No tool actually subprocesses pytest here.
 """
 
 import asyncio
+import json
 
 import pytest
 
@@ -153,3 +154,121 @@ def test_mcp_get_run_report_unknown_run(tmp_path):
     assert isinstance(out, (str, dict))
     if isinstance(out, str):
         assert "no-such-run" in out
+
+
+# ---------------------------------------------------------------------------
+# run_scenario / list_advisories behavioral coverage (Fix 1).
+#
+# These drive run_scenario through the real MCP transport, which subprocesses
+# pytest in a hermetic tmp cwd. Each case gets its own tmp project so a
+# collection error in one can never poison another run's collection. The pass
+# and fail cases together prove run_scenario genuinely executes the scenario
+# and reflects its real result: a no-op/stubbed run_scenario would return the
+# same `passed` value for both.
+# ---------------------------------------------------------------------------
+
+
+def _write_scenario_project(root, scenario_name, body):
+    """Lay down a hermetic one-scenario pytest project under ``root``.
+
+    The test function name embeds the scenario name because ``run_scenario``
+    selects via pytest's ``-k <name>`` filter, which matches the test nodeid
+    (the function name), not the ``@scenario`` metadata.
+    """
+    fn_name = "test_" + scenario_name
+    (root / "conftest.py").write_text("import testvibe.plugin  # noqa: F401\n")
+    (root / "test_demo.py").write_text(
+        "from testvibe import scenario\n"
+        "\n"
+        f"@scenario({scenario_name!r})\n"
+        f"def {fn_name}():\n"
+        f"    {body}\n"
+    )
+
+
+def test_mcp_run_scenario_pass_reflected_in_report(tmp_path):
+    """run_scenario runs pytest for real; a passing scenario -> report.passed=True."""
+    from testvibe.mcp import build_server
+
+    _write_scenario_project(tmp_path, "demo_pass", "assert True")
+    s = build_server(contract_path=None, cwd=tmp_path)
+
+    async def drive():
+        run_id = await s.call_tool("run_scenario", {"name": "demo_pass"})
+        rid = _unwrap(run_id)
+        report_raw = await s.call_tool("get_run_report", {"run_id": rid})
+        adv = await s.call_tool("list_advisories", {"run_id": rid})
+        return rid, report_raw, adv
+
+    rid, report_raw, adv = asyncio.run(drive())
+    assert isinstance(rid, str) and rid.startswith("run-")
+
+    report = json.loads(_unwrap(report_raw))
+    assert report["passed"] is True
+    assert report["run"] == "scenario:demo_pass"
+
+    # list_advisories on a real run_id returns a list (possibly empty), not None.
+    advisories = _unwrap(adv)
+    assert isinstance(advisories, list)
+
+
+def test_mcp_run_scenario_fail_reflected_in_report(tmp_path):
+    """run_scenario reflects a real assertion failure -> report.passed=False."""
+    from testvibe.mcp import build_server
+
+    _write_scenario_project(
+        tmp_path, "demo_fail", "assert False, 'intentional failure'"
+    )
+    s = build_server(contract_path=None, cwd=tmp_path)
+
+    async def drive():
+        run_id = await s.call_tool("run_scenario", {"name": "demo_fail"})
+        report_raw = await s.call_tool(
+            "get_run_report", {"run_id": _unwrap(run_id)}
+        )
+        return report_raw
+
+    report_raw = asyncio.run(drive())
+    report = json.loads(_unwrap(report_raw))
+    assert report["passed"] is False
+    # A genuine assertion failure is a product signal: recorded as a failure.
+    assert report["failures"], "expected a failure row for a failing scenario"
+
+
+def test_mcp_run_scenario_infra_failure_classified_infra(tmp_path):
+    """An infra failure (pytest collection error) -> kind='infra', not 'product'.
+
+    A test module that imports a missing module makes pytest error out during
+    collection (exit code 2) - a runner/environment problem, not a product
+    regression. Per the PLAYBOOK infra-vs-product taxonomy the RunReport must
+    classify this as ``infra``.
+    """
+    from testvibe.mcp import build_server
+
+    (tmp_path / "conftest.py").write_text("import testvibe.plugin  # noqa: F401\n")
+    # The bad import runs at collection time -> pytest exits 2 (infra).
+    (tmp_path / "test_broken.py").write_text(
+        "from testvibe import scenario\n"
+        "import does_not_exist_module_xyz  # noqa: F401  # collection error\n"
+        "\n"
+        "@scenario('broken')\n"
+        "def test_broken():\n"
+        "    assert True\n"
+    )
+    s = build_server(contract_path=None, cwd=tmp_path)
+
+    async def drive():
+        run_id = await s.call_tool("run_scenario", {"name": "broken"})
+        report_raw = await s.call_tool(
+            "get_run_report", {"run_id": _unwrap(run_id)}
+        )
+        return report_raw
+
+    report_raw = asyncio.run(drive())
+    report = json.loads(_unwrap(report_raw))
+    assert report["passed"] is False
+    kinds = {f["kind"] for f in report["failures"]}
+    assert "infra" in kinds, f"expected infra classification, got {kinds}"
+    assert "product" not in kinds, (
+        "collection error must NOT be classified as a product regression"
+    )

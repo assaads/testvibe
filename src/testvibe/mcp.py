@@ -9,12 +9,13 @@ runs, surface coverage gaps, and grow the quarantine corpus. All interpretation
 of the returned rows stays with the agent.
 
 ``build_server(contract_path=None)`` constructs the server. ``contract_path=None``
-means "no contract": the server degrades to a no-op (empty fixture/touched sets,
-no transcript) so the advisory tools simply return ``[]`` until the agent feeds
-them data, and the corpus path defaults to ``./known-failures.yaml``. Optional
-kwargs (``corpus_path``, ``fixture_paths``, ``touched_paths``, ``transcript``,
-``baseline``, ``cwd``) override those defaults so callers - and tests - can pin
-a deterministic surface without depending on cwd state.
+uses ``./testvibe.yaml`` in the cwd if present, else an empty contract (empty
+fixture/touched sets, no transcript) so the advisory tools simply return ``[]``
+until the agent feeds them data, and the corpus path defaults to
+``./known-failures.yaml``. Optional kwargs (``corpus_path``, ``fixture_paths``,
+``touched_paths``, ``transcript``, ``baseline``, ``cwd``) override those
+defaults so callers - and tests - can pin a deterministic surface without
+depending on cwd state.
 
 State (run reports + their advisory rows) is held in-process, keyed by the
 ``run_id`` that ``run_scenario`` returns.
@@ -99,10 +100,11 @@ def build_server(
     Parameters
     ----------
     contract_path:
-        Path to a ``testvibe.yaml`` contract. ``None`` (default) means "no
-        contract": the server runs with empty fixture/touched sets and no
-        transcript, so the advisory tools return ``[]`` until the agent feeds
-        them data. If a path is given and exists, it is parsed (best-effort) for
+        Path to a ``testvibe.yaml`` contract. ``None`` (default) uses
+        ``./testvibe.yaml`` in the cwd if present, else an empty contract (empty
+        fixture/touched sets, no transcript) so the advisory tools return ``[]``
+        until the agent feeds them data. If a path is given and exists, it is
+        parsed (best-effort) for
         ``fixture_paths``/``touched_paths``/``transcript``/``baseline`` defaults.
     corpus_path:
         Path to ``known-failures.yaml``. Defaults to ``./known-failures.yaml``
@@ -165,6 +167,17 @@ def build_server(
             "-q",
         ]
         passed = False
+        # ``infra`` separates runner/environment failures from genuine product
+        # regressions (PLAYBOOK infra-vs-product taxonomy). A pytest exit code
+        # of 1 means a scenario assertion failed -> product. Any other non-zero
+        # code (2 collection error, 3 internal error, 4 usage, 5 no tests
+        # collected) or a subprocess exception is the harness/environment
+        # misbehaving -> infra, not a product bug.
+        # ``sys.executable -m pytest`` never raises FileNotFoundError (the
+        # interpreter always exists; a missing pytest module makes the python
+        # invocation exit non-zero with a stderr message instead), so there is
+        # no FileNotFoundError branch to handle here.
+        infra = False
         stdout = ""
         stderr = ""
         try:
@@ -176,11 +189,12 @@ def build_server(
                 timeout=600,
             )
             passed = proc.returncode == 0
+            if not passed and proc.returncode != 1:
+                infra = True
             stdout = proc.stdout or ""
             stderr = proc.stderr or ""
-        except FileNotFoundError:
-            stderr = "pytest could not be invoked"
         except subprocess.TimeoutExpired as exc:
+            infra = True
             stderr = "scenario run timed out"
             stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
 
@@ -191,8 +205,12 @@ def build_server(
         if not passed:
             report.add_failure(
                 Failure(
-                    kind="product",
-                    message=f"scenario '{name}' did not pass",
+                    kind="infra" if infra else "product",
+                    message=(
+                        f"scenario '{name}' runner failed (infra)"
+                        if infra
+                        else f"scenario '{name}' did not pass"
+                    ),
                     detail=combined[-4000:] if combined else "no output captured",
                 )
             )
