@@ -6,8 +6,10 @@ scaffold/cli goal. A no-op ``main`` exists here only so the
 ``pyproject.toml`` resolves at install time and ``testvibe`` on the PATH does
 not crash with ``ImportError``. Replaced wholesale by the real CLI later.
 """
+import sys
 
 
 def main() -> int:
-    """Placeholder entry point — prints a notice and exits cleanly."""
-    raise SystemExit(0)
+    """Minimal stub CLI. Real subcommands (init/upgrade/run/...) arrive with the scaffold goal."""
+    sys.stderr.write("testvibe: CLI not implemented yet (stub).\n")
+    return 0

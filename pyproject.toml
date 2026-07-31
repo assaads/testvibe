@@ -21,7 +21,7 @@ dev = [
     "mypy>=1.10",
 ]
 mcp = ["fastmcp>=2.0"]
-fuzz = ["hypothesis>=6.0"]
+fuzz = ["hypothesis>=6.0", "pytest>=8.0"]
 
 [project.scripts]
 testvibe = "testvibe.cli:main"
@@ -31,6 +31,7 @@ testvibe = "testvibe.plugin"
 
 [tool.hatch.version]
 source = "vcs"
+fallback_version = "0.0.0"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/testvibe"]
