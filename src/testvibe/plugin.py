@@ -5,6 +5,11 @@ fixture (Task A2), and auto-collects a ``known-failures.yaml`` corpus as
 quarantined xfail-strict tests (Task A4).
 """
 
+# stdlib ``warnings`` is used (rather than pytest's PytestWarning) so the
+# collection hook can emit a visible, capturable warning without depending on
+# pytest internals. Pytest surfaces these in its warning summary.
+import warnings
+
 import pytest
 
 # Marker names every testvibe scenario/annotation may carry. Centralized so
@@ -82,11 +87,21 @@ class _KnownFailuresFile(pytest.File):
     def collect(self):
         # Imported lazily so the plugin module never fails to import if the
         # corpus module has an unmet dependency in some other environment.
-        from testvibe.corpus import load_corpus, quarantine_tests_for
+        from testvibe.corpus import CorpusError, load_corpus, quarantine_tests_for
 
-        for test_name, repro_fn, _status in quarantine_tests_for(
-            load_corpus(self.path)
-        ):
+        try:
+            entries = load_corpus(self.path)
+        except CorpusError as e:
+            # A malformed known-failures.yaml must NOT abort the whole pytest
+            # run — warn and skip the quarantine items for this file only.
+            warnings.warn(
+                f"testvibe: skipping malformed known-failures corpus at "
+                f"{self.path}: {e}",
+                stacklevel=2,
+            )
+            return
+
+        for test_name, repro_fn, _status in quarantine_tests_for(entries):
             yield _QuarantineItem.from_parent(
                 self, name=test_name, repro_fn=repro_fn, entry_id=test_name
             )

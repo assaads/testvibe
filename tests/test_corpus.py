@@ -17,6 +17,8 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # Plan snippet (A4 Step 1) — the canonical acceptance test.
@@ -93,6 +95,41 @@ def test_load_corpus_empty_file_returns_empty(tmp_path: pathlib.Path):
 
 
 # ---------------------------------------------------------------------------
+# Malformed-input resilience — load_corpus must raise a clear, named
+# CorpusError (never a cryptic AttributeError / TypeError / yaml.YAMLError) so
+# the plugin's collection hook can catch it and skip the quarantine set
+# instead of aborting the whole pytest run.
+# ---------------------------------------------------------------------------
+def test_load_corpus_top_level_mapping_raises_corpus_error(tmp_path: pathlib.Path):
+    from testvibe.corpus import CorpusError, load_corpus
+
+    (tmp_path / "known-failures.yaml").write_text("id: not-a-list\ninvariant: x\n")
+    with pytest.raises(CorpusError):
+        load_corpus(tmp_path / "known-failures.yaml")
+
+
+def test_load_corpus_entry_missing_fields_raises_corpus_error(tmp_path: pathlib.Path):
+    from testvibe.corpus import CorpusError, load_corpus
+
+    (tmp_path / "known-failures.yaml").write_text(textwrap.dedent("""
+        - id: incomplete
+          status: open
+    """))
+    with pytest.raises(CorpusError):
+        load_corpus(tmp_path / "known-failures.yaml")
+
+
+def test_load_corpus_malformed_yaml_raises_corpus_error(tmp_path: pathlib.Path):
+    from testvibe.corpus import CorpusError, load_corpus
+
+    (tmp_path / "known-failures.yaml").write_text(
+        " - id: broken\n    bad: [unterminated\n"
+    )
+    with pytest.raises(CorpusError):
+        load_corpus(tmp_path / "known-failures.yaml")
+
+
+# ---------------------------------------------------------------------------
 # Plugin collection hook (pytest_collect_file) for known-failures.yaml.
 # ---------------------------------------------------------------------------
 def test_quarantine_collected_from_yaml(tmp_path: pathlib.Path):
@@ -163,3 +200,17 @@ def test_failing_open_repro_xfails_and_passes(tmp_path: pathlib.Path):
     )
     assert out.returncode == 0, out.stdout + out.stderr
     assert "1 xfailed" in out.stdout
+
+
+def test_malformed_known_failures_yaml_does_not_break_collection(tmp_path: pathlib.Path):
+    # A malformed known-failures.yaml must NOT abort the whole pytest run — the
+    # plugin catches CorpusError, warns, and skips the quarantine items, so the
+    # rest of the suite collects normally.
+    (tmp_path / "known-failures.yaml").write_text("id: not-a-list\ninvariant: x\n")
+    (tmp_path / "test_plain.py").write_text("def test_ok():\n    assert True\n")
+    out = subprocess.run(
+        [sys.executable, "-m", "pytest", str(tmp_path), "--collect-only", "-q"],
+        capture_output=True, text=True,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "test_ok" in out.stdout

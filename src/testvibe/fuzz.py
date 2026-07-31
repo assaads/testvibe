@@ -39,8 +39,15 @@ def run_fuzz(
 ) -> bool:
     """Run *model_cls* as a Hypothesis state-machine test.
 
-    Returns ``True`` if a violation was found (Hypothesis raised), ``False`` if
-    the model satisfied its invariants across the whole search.
+    Returns ``True`` if an invariant violation was found, ``False`` if the model
+    satisfied its invariants across the whole search. Only a genuine
+    ``@invariant`` break (surfaced by Hypothesis as an ``AssertionError``)
+    counts as a violation and yields ``True``.
+
+    Any other exception — a bug inside a ``@rule`` body (``TypeError``,
+    ``KeyError``, ...), a Hypothesis setup error, etc. — is *not* an invariant
+    break, so it is allowed to propagate to the caller rather than being
+    swallowed as a false "found violation".
 
     A stdin shim is installed so Hypothesis never blocks trying to read the
     console; deadline/health-check suppressors make the run deterministic and
@@ -58,8 +65,12 @@ def run_fuzz(
     try:
         run_state_machine_as_test(model_cls, settings=fuzz_settings)
         return False
-    except Exception:
-        # An invariant was broken -> a violation was found.
+    except AssertionError:
+        # A genuine invariant violation — Hypothesis propagates the ``assert``
+        # from an ``@invariant`` as a bare ``AssertionError``. Only this counts
+        # as "a violation was found". Any other exception (TypeError, KeyError,
+        # a Hypothesis setup error, ...) is a bug in the model under test, not
+        # an invariant break, so it is allowed to propagate unchanged.
         return True
     finally:
         sys.stdin = old_stdin
