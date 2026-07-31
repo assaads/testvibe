@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "testvibe"
+dynamic = ["version"]
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "detect-secrets>=1.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "hypothesis>=6.0",
+    "pytest-benchmark>=4.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+mcp = ["fastmcp>=2.0"]
+fuzz = ["hypothesis>=6.0"]
+
+[project.scripts]
+testvibe = "testvibe.cli:main"
+
+[project.entry-points.pytest11]
+testvibe = "testvibe.plugin"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/testvibe"]
