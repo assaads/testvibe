@@ -73,3 +73,12 @@ warn_unreachable = true
 # Third-party libs without stubs (e.g. detect-secrets) fall back to Any so the
 # gate fails on real type bugs in testvibe itself, not on missing upstream types.
 ignore_missing_imports = true
+
+# ---- pytest isolation -------------------------------------------------------
+# Keep the self-dogfood ``scenarios/`` suite OFF the default gate: a bare
+# ``pytest`` from the repo root collects ONLY ``tests/`` (the 95-test unit
+# suite), so the dogfood scenarios can only run via an explicit
+# ``pytest scenarios/`` invocation. This also keeps the plugin's global
+# ``known-failures.yaml`` collector from ever walking scenarios/ at gate time.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
