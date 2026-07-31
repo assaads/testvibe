@@ -27,7 +27,9 @@ runs:
 
     - name: Type-check (mypy)
       shell: bash
-      run: mypy
+      # Type the shipped package. A bare `mypy` errors with no target; `src`
+      # is where the package lives (src/testvibe layout).
+      run: mypy src
 
     - name: Scrub tool-specific env and run the hermetic suite
       shell: bash
@@ -43,3 +45,20 @@ runs:
           done
         fi
         pytest -m "not live and not dogfood" --benchmark-disable
+
+    - name: Self-dogfood suite (testvibe testing itself)
+      shell: bash
+      env:
+        TESTVIBE_SCRUB_ENV: ${{ inputs.scrub-env }}
+      run: |
+        # The self-dogfood scenarios/ suite (S0–S7 + S4b MCP round-trip) —
+        # testvibe's own @scenario tests exercising testvibe. Isolated from the
+        # unit gate by testpaths=["tests"]; invoked explicitly here. Hermetic
+        # scenarios run; canary/dogfood kinds are skip-marked (-m filter keeps
+        # the gate's "not live and not dogfood" contract).
+        if [ -n "$TESTVIBE_SCRUB_ENV" ]; then
+          for var in $(compgen -v | grep "^$TESTVIBE_SCRUB_ENV" || true); do
+            unset "$var"
+          done
+        fi
+        pytest scenarios/ -m "not live and not dogfood" -q
