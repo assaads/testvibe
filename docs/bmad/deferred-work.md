@@ -34,3 +34,20 @@ tradeoffs deferred by design. Surfaced again at step-05. None block this spec.
   target is configured. This is a latent bug in testvibe's own S0 CI gate (pre-existing,
   at baseline). Not caused by this spec (src/testvibe untouched). Candidate follow-up:
   `run: mypy src` (or add `files = ["src"]` under `[tool.mypy]`).
+  **Update (2026-07-31): fixed to `mypy src` in commit `439d948`.**
+
+## Gaps the original plan missed (surfaced 2026-07-31 by running the self-dogfood work)
+
+Full narrative + Phase D trial in [`plans/phase-d-trial-checklist.md`](plans/phase-d-trial-checklist.md).
+
+- **[G1] CLI stub gap — plan vs. code drift.** `src/testvibe/cli.py` has
+  `run`, `corpus {add,promote}`, `dogfood`, `canary`, `autopilot` as exit-2
+  `_not_implemented` stubs; only `init`/`upgrade` work. The plan's File Structure
+  implies they exist. Either implement them or correct the plan.
+- **[G2] Self-dogfood is a proof point the plan never specified.** Commit
+  `bca79be` (testvibe testing itself) is complementary evidence to the plan's
+  syncestra Phase D — not a substitute. Both belong in "proven."
+- **[G3-security] Embedded GitHub PAT in `origin` remote URL.** `git remote -v`
+  leaks a valid `ghp_…` token. Rotate + move credential to a credential helper /
+  env / SSH remote. Tracked in project memory `testvibe-remote-embedded-pat`.
+  (The bare-`mypy` gate bug — G3's sibling — is now fixed in `439d948`.)
