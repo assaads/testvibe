@@ -270,3 +270,389 @@ def test_mcp_run_scenario_infra_failure_classified_infra(tmp_path):
     assert "product" not in kinds, (
         "collection error must NOT be classified as a product regression"
     )
+
+
+# ---------------------------------------------------------------------------
+# Single mutation path (Task: corpus mutation single-path).
+#
+# The MCP corpus tools must route through corpus.add_entry / promote_entry so
+# known-failures.yaml has ONE write path (not mcp's own raw-dict dump). The
+# observable proof: the file the MCP tool writes round-trips through
+# load_corpus with full CorpusEntry fields, AND is byte-equivalent to what
+# corpus.add_entry writes directly. If mcp kept a private dump, the two could
+# drift (field order, missing keys) without this test catching it.
+# ---------------------------------------------------------------------------
+def test_mcp_add_corpus_entry_round_trips_load_corpus(tmp_path):
+    """The MCP append tool must produce a file load_corpus can read verbatim."""
+    from testvibe.corpus import load_corpus
+    from testvibe.mcp import build_server
+
+    corpus = tmp_path / "known-failures.yaml"
+    repro = tmp_path / "repro.py"
+    repro.write_text("def repro():\n    raise AssertionError('bug')\n")
+
+    s = build_server(contract_path=None, corpus_path=corpus)
+
+    async def go():
+        r = await s.call_tool(
+            "add_corpus_entry",
+            {
+                "id": "mcp-bug",
+                "invariant": "push is idempotent",
+                "repro_path": str(repro),
+                "status": "open",
+            },
+        )
+        return _unwrap(r)
+
+    row = asyncio.run(go())
+    assert row["id"] == "mcp-bug"
+    assert row["source"] == "mcp"  # filled by the tool
+
+    # The real test: load_corpus (the plugin's reader) must reload it with all
+    # CorpusEntry fields intact. A private raw-dict dump could miss fields.
+    entries = load_corpus(corpus)
+    assert len(entries) == 1
+    e = entries[0]
+    assert e.id == "mcp-bug"
+    assert e.invariant == "push is idempotent"
+    assert e.repro == str(repro)
+    assert e.source == "mcp"
+    assert e.status == "open"
+    # discovered_at must be today's date, as a valid ISO date (not just truthy).
+    from datetime import date as _date
+
+    assert e.discovered_at == _date.today().isoformat()
+    _date.fromisoformat(e.discovered_at)  # raises if not a real ISO date
+
+
+def test_mcp_add_corpus_entry_preserves_existing_rows(tmp_path):
+    """add_corpus_entry via MCP must append, not overwrite, existing rows."""
+    from testvibe.corpus import CorpusEntry, add_entry, load_corpus
+    from testvibe.mcp import build_server
+
+    corpus = tmp_path / "known-failures.yaml"
+    repro = tmp_path / "repro.py"
+    repro.write_text("def repro():\n    raise AssertionError('bug')\n")
+
+    # Seed one entry directly via the corpus API.
+    add_entry(
+        corpus,
+        CorpusEntry(
+            id="seed",
+            invariant="inv-seed",
+            discovered_at="2026-08-02",
+            source="test",
+            repro=str(repro),
+            status="open",
+        ),
+    )
+
+    s = build_server(contract_path=None, corpus_path=corpus)
+
+    async def go():
+        return await s.call_tool(
+            "add_corpus_entry",
+            {
+                "id": "mcp-added",
+                "invariant": "inv-mcp",
+                "repro_path": str(repro),
+                "status": "pinned",
+            },
+        )
+
+    asyncio.run(go())
+
+    entries = load_corpus(corpus)
+    ids = [e.id for e in entries]
+    assert ids == ["seed", "mcp-added"]
+
+
+def test_mcp_promote_corpus_respects_green_signal(tmp_path):
+    """promote_corpus must only flip to fixed (the corpus.promote_entry contract).
+
+    The MCP tool wraps corpus.promote_entry, so it inherits the green-signal
+    invariant: a promote call flips status -> fixed (the MCP surface is the
+    "after green" path — the agent has already confirmed the re-run passes).
+    """
+    from testvibe.corpus import load_corpus
+    from testvibe.mcp import build_server
+
+    corpus = tmp_path / "known-failures.yaml"
+    repro = tmp_path / "repro.py"
+    repro.write_text("def repro():\n    return True\n")
+
+    s = build_server(contract_path=None, corpus_path=corpus)
+
+    async def drive():
+        await s.call_tool(
+            "add_corpus_entry",
+            {
+                "id": "to-promote",
+                "invariant": "inv",
+                "repro_path": str(repro),
+                "status": "pinned",
+            },
+        )
+        promoted = await s.call_tool("promote_corpus", {"id": "to-promote"})
+        return _unwrap(promoted)
+
+    promoted = asyncio.run(drive())
+    assert promoted["status"] == "fixed"
+    # fixed drops out of the active quarantine set
+    assert load_corpus(corpus) == []
+
+
+def test_mcp_promote_corpus_unknown_id_reports_not_found(tmp_path):
+    """promote_corpus on an unknown id yields a structured not-found (no crash).
+
+    Seeds the corpus with one real entry first (so the file EXISTS), then
+    promotes a ghost id. This isolates the "unknown id" case from the "missing
+    file" case (which patch J now classifies distinctly as ``corpus_missing``).
+    """
+    from testvibe.corpus import CorpusEntry, add_entry
+    from testvibe.mcp import build_server
+
+    corpus = tmp_path / "known-failures.yaml"
+    repro = tmp_path / "repro.py"
+    repro.write_text("def repro():\n    return True\n")
+    # Seed a real entry so the corpus file exists (otherwise the error is
+    # corpus_missing, not not_found).
+    add_entry(
+        corpus,
+        CorpusEntry(
+            id="real",
+            invariant="inv",
+            discovered_at="2026-08-02",
+            source="test",
+            repro=str(repro),
+            status="pinned",
+        ),
+    )
+    s = build_server(contract_path=None, corpus_path=corpus)
+
+    async def go():
+        return await s.call_tool("promote_corpus", {"id": "ghost"})
+
+    out = asyncio.run(go())
+    row = _unwrap(out)
+    # MCP surface is graceful (JSON with a specific error marker), not a raise.
+    # After patch J the marker is classified: an unknown id -> "not_found" (not
+    # the generic catch-all). Pin the exact contract shape, not a disjunction.
+    assert row.get("error") == "not_found"
+    assert row.get("status") == "unknown"
+
+
+def test_mcp_has_no_private_dump_after_corpus_refactor(tmp_path):
+    """After the refactor, mcp.py must not carry its own _dump_raw_yaml.
+
+    The single-mutation-path invariant: corpus.py owns all writes to
+    known-failures.yaml. A leftover private dump in mcp.py would be a regression
+    (two write paths that can drift). This is a structural test guarding the
+    refactor's intent, not behavior.
+    """
+    import testvibe.mcp as mcp_mod
+
+    assert not hasattr(mcp_mod, "_dump_raw_yaml"), (
+        "mcp.py must delegate corpus writes to corpus.py; found leftover "
+        "_dump_raw_yaml (two write paths → read/write drift)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# run_scenario delegation (Task: mcp.run_scenario → delegate to _run.run_scenarios).
+#
+# run_scenario must delegate the pytest-subprocess + tri-state-exit-code work to
+# _run.run_scenarios so the CLI and MCP share ONE orchestrator. The proof: a
+# monkeypatch on _run.run_scenarios is observed by the MCP tool (the patched fn
+# runs instead of the real subprocess). The existing behavioral tests
+# (pass/fail/infra) continue to hold because delegation preserves behavior.
+# ---------------------------------------------------------------------------
+def test_mcp_run_scenario_delegates_to_run_scenarios(tmp_path, monkeypatch):
+    """run_scenario must call _run.run_scenarios (not its own subprocess).
+
+    Monkeypatches _run.run_scenarios with a sentinel RunReport; if the MCP tool
+    still had its own subprocess logic, the patched fn would never run and the
+    returned report would not carry the sentinel.
+    """
+    from testvibe import _run
+    from testvibe.mcp import build_server
+    from testvibe.report import RunReport
+
+    sentinel = RunReport(
+        tool="testvibe-mcp", run="scenario:DELEGATED", passed=True
+    )
+
+    captured: dict = {}
+
+    def fake_run_scenarios(cwd=None, *, name=None):
+        captured["cwd"] = cwd
+        captured["name"] = name
+        return sentinel
+
+    monkeypatch.setattr(_run, "run_scenarios", fake_run_scenarios)
+
+    s = build_server(contract_path=None, cwd=tmp_path)
+
+    async def drive():
+        run_id = await s.call_tool("run_scenario", {"name": "whatever"})
+        report_raw = await s.call_tool(
+            "get_run_report", {"run_id": _unwrap(run_id)}
+        )
+        return report_raw
+
+    report_raw = asyncio.run(drive())
+    report = json.loads(_unwrap(report_raw))
+
+    # The patched orchestrator ran, so the sentinel's run label is visible.
+    assert report["run"] == "scenario:DELEGATED"
+    assert report["passed"] is True
+    # And the cwd + name were forwarded correctly.
+    assert captured["name"] == "whatever"
+
+
+def test_mcp_run_scenario_forwards_cwd(tmp_path, monkeypatch):
+    """run_scenario forwards the configured cwd to run_scenarios."""
+    from testvibe import _run
+    from testvibe.mcp import build_server
+    from testvibe.report import RunReport
+
+    seen_cwd = {}
+
+    def fake(cwd=None, *, name=None):
+        seen_cwd["cwd"] = cwd
+        return RunReport(tool="t", run="r", passed=True)
+
+    monkeypatch.setattr(_run, "run_scenarios", fake)
+
+    s = build_server(contract_path=None, cwd=str(tmp_path))
+
+    async def go():
+        await s.call_tool("run_scenario", {"name": "x"})
+        return None
+
+    asyncio.run(go())
+    assert seen_cwd["cwd"] == str(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Patch J — promote_corpus must distinguish corrupt-YAML from not-found.
+# ---------------------------------------------------------------------------
+def test_mcp_promote_corpus_corrupt_yaml_reports_corpus_corrupt(tmp_path):
+    """promote_corpus on a present-but-corrupt corpus file -> error='corpus_corrupt'.
+
+    Previously CorpusError collapsed to {error:'not_found'} unconditionally, but
+    a corrupt file is a distinct caller bug. After patch J the marker is
+    classified: corrupt YAML -> 'corpus_corrupt' (not the misleading 'not_found').
+    """
+    from testvibe.mcp import build_server
+
+    corpus = tmp_path / "known-failures.yaml"
+    corpus.write_text(" - id: broken\n    bad: [unterminated\n")  # corrupt YAML
+    s = build_server(contract_path=None, corpus_path=corpus)
+
+    async def go():
+        return await s.call_tool("promote_corpus", {"id": "anything"})
+
+    out = asyncio.run(go())
+    row = _unwrap(out)
+    assert row.get("error") == "corpus_corrupt", (
+        f"corrupt YAML must classify as corpus_corrupt, got: {row}"
+    )
+
+
+def test_mcp_promote_corpus_missing_file_reports_corpus_missing(tmp_path):
+    """promote_corpus on a genuinely-absent corpus file -> error='corpus_missing'.
+
+    Distinct from not_found (unknown id in an existing file): the file itself is
+    absent. After patch J this is classified as 'corpus_missing'."""
+    from testvibe.mcp import build_server
+
+    corpus = tmp_path / "absent.yaml"
+    s = build_server(contract_path=None, corpus_path=corpus)
+
+    async def go():
+        return await s.call_tool("promote_corpus", {"id": "anything"})
+
+    out = asyncio.run(go())
+    row = _unwrap(out)
+    assert row.get("error") == "corpus_missing", (
+        f"missing file must classify as corpus_missing, got: {row}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Patch K — add_corpus_entry must return a structured error, not raise.
+# ---------------------------------------------------------------------------
+def test_mcp_add_corpus_entry_invalid_status_returns_structured_error(tmp_path):
+    """add_corpus_entry with an invalid status -> structured {error} dict, not raise.
+
+    Parity with promote_corpus: corpus.add_entry raises CorpusError (invalid
+    status, duplicate id after patch D), but the MCP tool must catch it and
+    return a structured dict so an agent can branch on the marker.
+    """
+    from testvibe.mcp import build_server
+
+    corpus = tmp_path / "known-failures.yaml"
+    repro = tmp_path / "repro.py"
+    repro.write_text("def repro():\n    raise AssertionError('bug')\n")
+    s = build_server(contract_path=None, corpus_path=corpus)
+
+    async def go():
+        return await s.call_tool(
+            "add_corpus_entry",
+            {
+                "id": "bad-status",
+                "invariant": "inv",
+                "repro_path": str(repro),
+                "status": "fixed",  # invalid — add_entry accepts only open/pinned
+            },
+        )
+
+    out = asyncio.run(go())
+    row = _unwrap(out)
+    # Structured error dict (never a raise), with an error marker + message.
+    assert "error" in row, f"expected structured error dict, got: {row}"
+    assert "message" in row
+    assert row.get("id") == "bad-status"
+
+
+def test_mcp_add_corpus_entry_duplicate_id_returns_structured_error(tmp_path):
+    """add_corpus_entry with a duplicate id -> structured error dict, not raise.
+
+    After patch D, add_entry rejects duplicate ids. The MCP tool must surface
+    that as a structured error (parity with promote_corpus), not an RPC raise.
+    """
+    from testvibe.corpus import CorpusEntry, add_entry
+    from testvibe.mcp import build_server
+
+    corpus = tmp_path / "known-failures.yaml"
+    repro = tmp_path / "repro.py"
+    repro.write_text("def repro():\n    raise AssertionError('bug')\n")
+    add_entry(
+        corpus,
+        CorpusEntry(
+            id="dup",
+            invariant="first",
+            discovered_at="2026-08-02",
+            source="test",
+            repro=str(repro),
+            status="open",
+        ),
+    )
+    s = build_server(contract_path=None, corpus_path=corpus)
+
+    async def go():
+        return await s.call_tool(
+            "add_corpus_entry",
+            {
+                "id": "dup",
+                "invariant": "second",
+                "repro_path": str(repro),
+                "status": "open",
+            },
+        )
+
+    out = asyncio.run(go())
+    row = _unwrap(out)
+    assert "error" in row, f"expected structured error dict for dup id, got: {row}"

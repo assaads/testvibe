@@ -108,11 +108,23 @@ def test_cli_init_dispatches_to_generate(tmp_path: pathlib.Path):
 
 
 def test_cli_unimplemented_subcommands_return_nonzero(capsys):
-    """Plan subcommands not owned by this goal no-op with a clear non-zero code."""
+    """Honest stubs (dogfood/canary/autopilot) exit 3 (needs host/agent).
+
+    These need external prerequisites (real host/agent) and exit 3 — NOT the old
+    exit-2 'not implemented yet'. The full dispatch coverage for run/corpus
+    (now real commands) lives in tests/test_cli.py. Tightened from ``rc != 0`` to
+    ``rc == 3`` (the _RC_NEEDS_HOST_AGENT code) so the exact contract is verified.
+    """
     from testvibe import cli
 
-    rc = cli.main(["run"])
-    assert rc != 0
-    captured = capsys.readouterr()
-    combined = (captured.err + captured.out).lower()
-    assert "not implemented" in combined
+    _RC_NEEDS_HOST_AGENT = 3
+    for name in ("dogfood", "canary", "autopilot"):
+        rc = cli.main([name])
+        assert rc == _RC_NEEDS_HOST_AGENT, (
+            f"{name} must exit {_RC_NEEDS_HOST_AGENT} (needs host/agent), got {rc}"
+        )
+        captured = capsys.readouterr()
+        combined = (captured.err + captured.out).lower()
+        assert "not implemented yet" not in combined, (
+            f"{name} must not say 'not implemented yet' (it is an honest exit-3 stub)"
+        )

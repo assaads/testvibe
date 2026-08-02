@@ -24,8 +24,6 @@ State (run reports + their advisory rows) is held in-process, keyed by the
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
 import uuid
 from datetime import date
 from pathlib import Path
@@ -34,44 +32,33 @@ from typing import Any
 import yaml
 from fastmcp import FastMCP
 
-from . import advisory
-from .report import Failure, RunReport
+from . import _run, advisory, corpus
+from .report import RunReport
 
 __all__ = ["build_server"]
 
 
-def _load_raw_yaml(path: Path) -> list[Any]:
-    """Best-effort load of a corpus file as a raw list of mappings.
-
-    Returns ``[]`` for a missing/empty/malformed file or anything that is not a
-    top-level YAML list - the corpus tools append/promote against this shape, so
-    a corrupt file degrades to an empty list rather than raising. (Strict
-    validation of *entry* fields is :func:`testvibe.corpus.load_corpus`'s job;
-    this loader only needs the raw rows.)
-    """
-    if not path.exists():
-        return []
-    try:
-        raw = yaml.safe_load(path.read_text())
-    except yaml.YAMLError:
-        return []
-    if raw is None:
-        return []
-    if not isinstance(raw, list):
-        return []
-    return raw
-
-
-def _dump_raw_yaml(path: Path, rows: list[Any]) -> None:
-    """Persist corpus rows, creating the parent directory if needed."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        yaml.safe_dump(rows, sort_keys=False, default_flow_style=False)
-    )
-
-
 def _adv_to_dict(a: advisory.Advisory) -> dict[str, str]:
     return {"kind": a.kind, "message": a.message, "detail": a.detail}
+
+
+def _classify_corpus_error(exc: corpus.CorpusError) -> str:
+    """Map a CorpusError to a specific MCP error marker.
+
+    CorpusError now covers three distinct caller bugs (missing file, unknown id,
+    corrupt YAML / non-dict row) that previously all collapsed to ``not_found``
+    on the MCP surface. Inspect the message so an agent can branch on the real
+    cause rather than guessing. Falls back to ``corpus_error`` for anything
+    unrecognized so future CorpusError shapes are still graceful (never a raise).
+    """
+    msg = str(exc).lower()
+    if "not found" in msg and "entry id" in msg:
+        return "not_found"
+    if "corpus file not found" in msg or "no such file" in msg:
+        return "corpus_missing"
+    if "malformed yaml" in msg or "not a list" in msg or "not a mapping" in msg:
+        return "corpus_corrupt"
+    return "corpus_error"
 
 
 def build_server(
@@ -149,66 +136,29 @@ def build_server(
         configured cwd, captures pass/fail + output, and stores a
         :class:`RunReport` keyed by the returned ``run_id``. Use
         ``get_run_report`` / ``list_advisories`` with that id to inspect it.
+
+        Delegates the pytest-subprocess + tri-state-exit-code work to
+        :func:`testvibe._run.run_scenarios` so the CLI ``run`` command and this
+        tool share one orchestrator. The report is then tagged
+        ``tool="testvibe-mcp"`` so MCP-sourced runs are distinguishable, and the
+        captured output is fed through :func:`testvibe.advisory.analyze` for
+        smell/coverage signals.
         """
         run_id = f"run-{uuid.uuid4().hex[:12]}"
-        cmd = [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-m",
-            "testvibe_scenario",
-            "-k",
-            str(name),
-            "-q",
-        ]
-        passed = False
-        # ``infra`` separates runner/environment failures from genuine product
-        # regressions (PLAYBOOK infra-vs-product taxonomy). A pytest exit code
-        # of 1 means a scenario assertion failed -> product. Any other non-zero
-        # code (2 collection error, 3 internal error, 4 usage, 5 no tests
-        # collected) or a subprocess exception is the harness/environment
-        # misbehaving -> infra, not a product bug.
-        # ``sys.executable -m pytest`` never raises FileNotFoundError (the
-        # interpreter always exists; a missing pytest module makes the python
-        # invocation exit non-zero with a stderr message instead), so there is
-        # no FileNotFoundError branch to handle here.
-        infra = False
-        stdout = ""
-        stderr = ""
-        try:
-            proc = subprocess.run(
-                cmd,
-                cwd=cfg_cwd,
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
-            passed = proc.returncode == 0
-            if not passed and proc.returncode != 1:
-                infra = True
-            stdout = proc.stdout or ""
-            stderr = proc.stderr or ""
-        except subprocess.TimeoutExpired as exc:
-            infra = True
-            stderr = "scenario run timed out"
-            stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
+        report = _run.run_scenarios(cwd=cfg_cwd, name=name)
+        report.tool = "testvibe-mcp"
 
-        report = RunReport(
-            tool="testvibe-mcp", run=f"scenario:{name}", passed=passed
-        )
-        combined = (stdout + "\n" + stderr).strip()
-        if not passed:
-            report.add_failure(
-                Failure(
-                    kind="infra" if infra else "product",
-                    message=(
-                        f"scenario '{name}' runner failed (infra)"
-                        if infra
-                        else f"scenario '{name}' did not pass"
-                    ),
-                    detail=combined[-4000:] if combined else "no output captured",
-                )
-            )
+        # Reconstruct the combined output transcript for the advisory analyzer.
+        # run_scenarios keeps the FULL (stdout+stderr) on report._full_output (a
+        # private attribute, NOT part of the RunReport dataclass surface) so the
+        # advisory analyzer sees the whole transcript while Failure.detail stays
+        # bounded ([-4000:]) for the stored/report surface. On a pass there is no
+        # failure row and the transcript is empty (matching the pre-refactor
+        # pass-path behavior where advisory received transcript="" and returned
+        # coverage gaps only).
+        combined = getattr(report, "_full_output", "")
+        if not combined and report.failures:
+            combined = report.failures[0].detail
 
         # Feed the run output through the advisory analyzer so the agent gets
         # smell/coverage signals alongside the pass/fail verdict. ``report=[]``
@@ -271,39 +221,69 @@ def build_server(
         ``discovered_at`` (today) and ``source="mcp"`` are filled so the row
         satisfies :class:`testvibe.corpus.CorpusEntry`'s required fields and is
         immediately picked up by the plugin's quarantine collection hook.
+
+        Routes through :func:`testvibe.corpus.add_entry` so known-failures.yaml
+        has a single mutation path (the CLI ``corpus add`` uses the same fn).
+
+        Returns a structured ``{error, message}`` dict (never raises) for
+        parity with :func:`promote_corpus` so an agent can branch on the marker
+        rather than catching an RPC exception.
         """
-        entry = {
-            "id": id,
-            "invariant": invariant,
-            "discovered_at": date.today().isoformat(),
-            "source": "mcp",
-            "repro": repro_path,
-            "status": status,
+        try:
+            entry = corpus.add_entry(
+                cfg_corpus,
+                corpus.CorpusEntry(
+                    id=id,
+                    invariant=invariant,
+                    discovered_at=date.today().isoformat(),
+                    source="mcp",
+                    repro=repro_path,
+                    status=status,
+                ),
+            )
+        except corpus.CorpusError as exc:
+            return {
+                "id": id,
+                "error": _classify_corpus_error(exc),
+                "message": str(exc),
+            }
+        return {
+            "id": entry.id,
+            "invariant": entry.invariant,
+            "discovered_at": entry.discovered_at,
+            "source": entry.source,
+            "repro": entry.repro,
+            "status": entry.status,
         }
-        rows = _load_raw_yaml(cfg_corpus)
-        rows.append(entry)
-        _dump_raw_yaml(cfg_corpus, rows)
-        return entry
 
     @m.tool()
     def promote_corpus(id: str) -> dict[str, str]:
         """Flip a corpus entry to ``status: fixed`` and drop its xfail pin.
 
-        Promotion works by writing ``status: fixed``; because
+        Delegates to :func:`testvibe.corpus.promote_entry` with ``passes=True``
+        (the MCP surface is the "after a green re-run" path — the agent has
+        already confirmed the repro passes before calling promote). Because
         :func:`testvibe.corpus.load_corpus` only collects ``open``/``pinned``
         entries, a fixed entry naturally drops out of the xfail quarantine set -
         no separate "delete xfail" step is needed.
         """
-        rows = _load_raw_yaml(cfg_corpus)
-        updated: dict[str, str] | None = None
-        for row in rows:
-            if isinstance(row, dict) and row.get("id") == id:
-                row["status"] = "fixed"
-                updated = row
-        if updated is None:
-            return {"id": id, "status": "unknown", "error": "not_found"}
-        _dump_raw_yaml(cfg_corpus, rows)
-        return updated
+        try:
+            entry = corpus.promote_entry(cfg_corpus, id, passes=True)
+        except corpus.CorpusError as exc:
+            return {
+                "id": id,
+                "status": "unknown",
+                "error": _classify_corpus_error(exc),
+                "message": str(exc),
+            }
+        return {
+            "id": entry.id,
+            "invariant": entry.invariant,
+            "discovered_at": entry.discovered_at,
+            "source": entry.source,
+            "repro": entry.repro,
+            "status": entry.status,
+        }
 
     return m
 
