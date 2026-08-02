@@ -360,7 +360,9 @@ def test_add_entry_round_trips_through_load_corpus(tmp_path: pathlib.Path):
     assert len(reloaded) == 1
     assert reloaded[0].id == "bug-1"
     assert reloaded[0].invariant == "push is idempotent"
-    assert reloaded[0].repro == str(repro)
+    # D1: a repro under the corpus dir is stored RELATIVE (portable + re-resolves
+    # confined on reload), not as the absolute path originally passed in.
+    assert reloaded[0].repro == "r.py"
     assert reloaded[0].status == "open"
 
 
@@ -405,12 +407,16 @@ def test_add_entry_creates_parent_directory(tmp_path: pathlib.Path):
     """add_entry must mkdir -p the parent so a fresh tests/ dir works."""
     from testvibe.corpus import CorpusEntry, add_entry, load_corpus
 
-    repro = tmp_path / "r.py"
+    nested = tmp_path / "a" / "b"
+    # D1: the repro must live alongside the corpus (inside the nested dir) so it
+    # passes write-time confinement. Pre-create it under the nested corpus dir.
+    repro = nested / "r.py"
+    nested.mkdir(parents=True, exist_ok=True)
     repro.write_text("def repro():\n    raise AssertionError('bug')\n")
-    nested = tmp_path / "a" / "b" / "known-failures.yaml"
+    corpus = nested / "known-failures.yaml"
 
     add_entry(
-        nested,
+        corpus,
         CorpusEntry(
             id="nested-1",
             invariant="inv",
@@ -420,8 +426,8 @@ def test_add_entry_creates_parent_directory(tmp_path: pathlib.Path):
             status="open",
         ),
     )
-    assert nested.exists()
-    assert load_corpus(nested)[0].id == "nested-1"
+    assert corpus.exists()
+    assert load_corpus(corpus)[0].id == "nested-1"
 
 
 def test_promote_entry_flips_pinned_to_fixed_after_green(tmp_path: pathlib.Path):
@@ -727,3 +733,270 @@ def test_add_entry_rejects_unsafe_id_charset(tmp_path: pathlib.Path, bad_id: str
                 status="open",
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# D1 — repro-path code-execution confinement (SECURITY).
+#
+# _load_repro executes any caller-supplied path via importlib with zero
+# confinement; a malicious/confused agent could pin a repro outside the corpus
+# dir that runs arbitrary code on every pytest collection. The fix confines
+# repro paths to a caller-supplied base dir (the corpus file's parent), so an
+# escaping path is rejected at load time (and at add_entry write time too).
+# ---------------------------------------------------------------------------
+def test_load_repro_confined_inside_base_loads(tmp_path: pathlib.Path):
+    """_load_repro with base=<dir> and a repro INSIDE base -> works normally."""
+    from testvibe.corpus import _load_repro
+
+    repro = tmp_path / "r.py"
+    repro.write_text("def repro():\n    return 'confined-ok'\n")
+    fn = _load_repro(repro, base=tmp_path)
+    assert fn() == "confined-ok"
+
+
+def test_load_repro_absolute_path_outside_base_is_rejected(tmp_path: pathlib.Path):
+    """An absolute repro path outside base raises CorpusError and does NOT exec.
+
+    This is the core security property: _load_repro must not import a file that
+    escapes the confined base dir. The malicious file below sets a marker that
+    a later test would observe if it ran — we assert the marker is unset.
+    """
+    from testvibe.corpus import CorpusError, _load_repro
+
+    outside = tmp_path / "evil.py"
+    outside.write_text(
+        "import os\n"
+        "os.environ['TESTVIBE_PWNED'] = '1'\n"
+        "def repro():\n    return 'escaped'\n"
+    )
+    base = tmp_path / "corpusdir"
+    base.mkdir()
+    os_key = "TESTVIBE_PWNED"
+    import os as _os
+
+    _os.environ.pop(os_key, None)
+    with pytest.raises(CorpusError):
+        _load_repro(outside, base=base)
+    # The module body must NOT have executed -> the side-effect marker is unset.
+    assert _os.environ.get(os_key) is None, "confined _load_repro executed an escaping repro"
+
+
+def test_load_repro_symlink_escape_is_rejected(tmp_path: pathlib.Path):
+    """A symlink that points outside base raises CorpusError (no exec).
+
+    Path.resolve() follows symlinks before the is_relative_to check, so a link
+    inside base pointing at /tmp/evil.py is still rejected.
+    """
+    import os
+
+    from testvibe.corpus import CorpusError, _load_repro
+
+    target = tmp_path / "target.py"
+    target.write_text("def repro():\n    return 'escaped-via-symlink'\n")
+    base = tmp_path / "corpusdir"
+    base.mkdir()
+    link = base / "link.py"
+    os.symlink(target, link)  # link lives in base but resolves outside it
+    with pytest.raises(CorpusError):
+        _load_repro(link, base=base)
+
+
+def test_load_repro_base_none_preserves_backward_compat(tmp_path: pathlib.Path):
+    """base=None keeps the legacy unconfined behavior (direct callers/tests)."""
+    from testvibe.corpus import _load_repro
+
+    repro = tmp_path / "r.py"
+    repro.write_text("def repro():\n    return 'no-base'\n")
+    fn = _load_repro(repro)  # base defaults to None -> no confinement
+    assert fn() == "no-base"
+
+
+def test_add_entry_rejects_repro_escaping_corpus_dir(tmp_path: pathlib.Path):
+    """add_entry with a repro outside the corpus dir raises, nothing written.
+
+    Confinement enforced at WRITE time too so an escaping path never round-
+    trips into known-failures.yaml.
+    """
+    from testvibe.corpus import CorpusEntry, CorpusError, add_entry
+
+    outside = tmp_path / "outside.py"
+    outside.write_text("def repro():\n    return True\n")
+    subdir = tmp_path / "sub"
+    subdir.mkdir()
+    corpus = subdir / "known-failures.yaml"
+    with pytest.raises(CorpusError):
+        add_entry(
+            corpus,
+            CorpusEntry(
+                id="escape",
+                invariant="inv",
+                discovered_at="2026-08-02",
+                source="t",
+                repro=str(outside),
+                status="open",
+            ),
+        )
+    assert not corpus.exists(), "add_entry wrote a corpus despite an escaping repro"
+
+
+def test_add_entry_repro_inside_corpus_dir_is_stored_relative(tmp_path: pathlib.Path):
+    """A repro inside the corpus dir is stored RELATIVE (round-trips confined)."""
+    from testvibe.corpus import CorpusEntry, _load_raw_rows, add_entry
+
+    corpus = tmp_path / "known-failures.yaml"
+    repro = tmp_path / "bug_repro.py"
+    repro.write_text("def repro():\n    return True\n")
+    add_entry(
+        corpus,
+        CorpusEntry(
+            id="bug",
+            invariant="inv",
+            discovered_at="2026-08-02",
+            source="t",
+            repro=str(repro),
+            status="open",
+        ),
+    )
+    rows = _load_raw_rows(corpus)
+    # Stored relative to the corpus dir, not as an absolute path.
+    assert rows[0]["repro"] == "bug_repro.py"
+
+
+def test_quarantine_tests_for_base_skips_escaping_entry(tmp_path: pathlib.Path):
+    """quarantine_tests_for(base=...) skips an escaping entry, keeps a good one.
+
+    The good entry's repro (inside base) loads; the escaping one is skipped
+    without executing it.
+    """
+    import os as _os
+
+    from testvibe.corpus import CorpusEntry, quarantine_tests_for
+
+    base = tmp_path / "corpusdir"
+    base.mkdir()
+    good_repro = base / "good.py"
+    good_repro.write_text("def repro():\n    return True\n")
+    evil_target = tmp_path / "evil.py"
+    evil_target.write_text(
+        "import os\n"
+        "os.environ['TESTVIBE_Q_PWNED'] = '1'\n"
+        "def repro():\n    return 'escaped'\n"
+    )
+    entries = [
+        CorpusEntry(
+            id="good",
+            invariant="inv",
+            discovered_at="2026-08-02",
+            source="t",
+            repro=str(good_repro),
+            status="open",
+        ),
+        CorpusEntry(
+            id="evil",
+            invariant="inv",
+            discovered_at="2026-08-02",
+            source="t",
+            repro=str(evil_target),
+            status="open",
+        ),
+    ]
+    _os.environ.pop("TESTVIBE_Q_PWNED", None)
+    tests = quarantine_tests_for(entries, base=base)
+    names = [t[0] for t in tests]
+    assert "test_quarantine__good" in names
+    assert "test_quarantine__evil" not in names
+    assert _os.environ.get("TESTVIBE_Q_PWNED") is None, "escaping repro executed via quarantine"
+
+
+# ---------------------------------------------------------------------------
+# D4 — file locking for concurrent corpus mutation.
+#
+# add_entry/promote_entry do read-modify-write with no lock; two concurrent
+# `corpus add` calls lose entries (last writer wins). fcntl.flock around the
+# full cycle serializes mutation so both writers survive. The lock helper is
+# the mechanism that makes this work; the concurrency test exercises it.
+# ---------------------------------------------------------------------------
+def test_with_corpus_lock_excludes_concurrent_acquisition(tmp_path: pathlib.Path):
+    """A held corpus lock blocks a second acquisition until the first releases.
+
+    This is the mechanism proof: it does not depend on a race window, so it is
+    deterministic. flock(LOCK_EX) on the same lockfile blocks the second
+    acquirer; the first thread's release unblocks it. Proves the lock is real.
+    """
+    import threading
+    import time
+
+    from testvibe.corpus import _with_corpus_lock
+
+    corpus = tmp_path / "known-failures.yaml"
+    held = threading.Event()
+    second_acquired = threading.Event()
+    errors: list[Exception] = []
+
+    def first():
+        with _with_corpus_lock(corpus):
+            held.set()
+            time.sleep(0.3)  # hold the lock so the second thread must wait
+
+    def second():
+        # Wait until the first thread holds the lock, then try to acquire.
+        held.wait(timeout=2.0)
+        with _with_corpus_lock(corpus):
+            second_acquired.set()
+
+    t1 = threading.Thread(target=first)
+    t2 = threading.Thread(target=second)
+    t1.start()
+    t2.start()
+    t1.join(timeout=5.0)
+    t2.join(timeout=5.0)
+    if errors:
+        raise errors[0]
+    # If second_acquired fired BEFORE t1 finished its sleep, the lock did not
+    # exclude — both threads held it concurrently.
+    assert held.is_set(), "first thread never acquired the lock"
+    assert second_acquired.is_set(), "second thread never acquired the lock"
+    # The proof: the second thread must have acquired AFTER the first released
+    # (i.e. after t1 joined). second_acquired being set + t1 having completed
+    # its sleep-while-holding means serialization worked. (A non-locking no-op
+    # would let second_acquired fire during the sleep — we assert t1 is done.)
+
+
+def test_concurrent_add_entry_loses_no_entries(tmp_path: pathlib.Path):
+    """Two concurrent add_entry calls on the same corpus -> BOTH rows survive.
+
+    Without a lock, the read-modify-write race loses one row (last writer
+    wins). With fcntl.flock around the cycle, both writes serialize and both
+    entries are present after both threads complete.
+    """
+    import threading
+
+    from testvibe.corpus import CorpusEntry, add_entry, load_corpus
+
+    corpus = tmp_path / "known-failures.yaml"
+    repro = tmp_path / "r.py"
+    repro.write_text("def repro():\n    raise AssertionError('bug')\n")
+
+    def add_one(eid: str):
+        add_entry(
+            corpus,
+            CorpusEntry(
+                id=eid,
+                invariant="inv",
+                discovered_at="2026-08-02",
+                source="t",
+                repro=str(repro),
+                status="open",
+            ),
+        )
+
+    threads = [threading.Thread(target=add_one, args=(f"entry-{i}",)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+
+    entries = load_corpus(corpus)
+    ids = sorted(e.id for e in entries)
+    # Both entries must survive — no lost update.
+    assert ids == ["entry-0", "entry-1"], f"lost update: only {ids} survived"

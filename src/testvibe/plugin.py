@@ -101,7 +101,9 @@ class _KnownFailuresFile(pytest.File):
             )
             return
 
-        for test_name, repro_fn, _status in quarantine_tests_for(entries):
+        for test_name, repro_fn, _status in quarantine_tests_for(
+            entries, base=self.path.parent
+        ):
             yield _QuarantineItem.from_parent(
                 self, name=test_name, repro_fn=repro_fn, entry_id=test_name
             )

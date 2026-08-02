@@ -316,7 +316,8 @@ def test_mcp_add_corpus_entry_round_trips_load_corpus(tmp_path):
     e = entries[0]
     assert e.id == "mcp-bug"
     assert e.invariant == "push is idempotent"
-    assert e.repro == str(repro)
+    # D1: repro stored relative to the corpus dir (colocated here).
+    assert e.repro == "repro.py"
     assert e.source == "mcp"
     assert e.status == "open"
     # discovered_at must be today's date, as a valid ISO date (not just truthy).

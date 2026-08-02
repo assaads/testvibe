@@ -6,27 +6,32 @@ Each is real; none were silently dropped.
 
 ## From G1 CLI-stubs review (2026-08-02, branch `feat/cli-real-commands`)
 
-- **repro-path arbitrary-code-execution vector (security, pre-existing).**
-  `_load_repro` (`src/testvibe/corpus.py`) executes any caller-supplied path via
-  `importlib` — no confinement to the repo root. `add_entry`/`--repro`/MCP
-  `repro_path` all accept arbitrary strings. A malicious/confused agent can pin a
-  repro that runs arbitrary code on every pytest collection. This surface predates
-  G1 (`_load_repro` always exec'd); the G1 change only stores the string. Fix:
-  validate repro resolves inside the project root; consider a sandbox. Tracked also
-  for a LeaFS entry. (Edge-case hunter + blind hunter — `escalate`/`defer`.)
-- **`_cmd_run` multi-kind branch is dead code.** `run_scenarios` adds at most one
-  `Failure`, so the `kinds == {'infra'} or (kinds and 'product' not in kinds)`
-  precedence logic in `cli.py` never fires. Harmless but misleading. Simplify to a
-  single-kind mapping when refactoring. (Blind hunter + acceptance auditor — `defer`.)
-- **CLI `corpus promote` exit code conflates usage-error with infra.** A wrong id
-  (caller bug) maps to exit 2 (infra) today; retrying won't help. Design judgment:
-  a distinct usage-error code or a documented "infra = collection/usage" convention.
-  (Blind hunter + acceptance auditor + edge-case hunter — `defer`.)
-- **corpus mutation is O(n) read-modify-write with no file lock.** Concurrent
-  `corpus add` invocations lose entries (lost-update across appenders); atomic-rename
-  protects against truncated-read but not the race. Add `fcntl.flock` around the
-  read-modify-write if the corpus ever grows or concurrent capture becomes common.
-  (Blind hunter + edge-case hunter — `defer`.)
+- **RESOLVED 2026-08-02 (D1) — repro-path arbitrary-code-execution vector
+  (security, pre-existing).** `_load_repro` now accepts an optional `base` and
+  confines repro paths to it (resolves symlinks; rejects absolute/relative
+  escapes via `Path.is_relative_to`). `add_entry` enforces confinement at write
+  time too AND stores the repro RELATIVE to the corpus dir when colocated (so it
+  re-resolves confined on reload). `quarantine_tests_for(base=...)` and the
+  pytest plugin pass the corpus file's parent dir as base; an escaping repro is
+  skipped (not executed). `base=None` preserves the legacy unconfined path for
+  direct callers. (Edge-case hunter + blind hunter.)
+- **RESOLVED 2026-08-02 (D2) – `_cmd_run` multi-kind branch is dead code.**
+  Simplified to single-failure mapping: `passed`->0, `kind=="product"`->1,
+  else ->2. `run_scenarios` adds at most ONE Failure, so the former set logic
+  never fired. Behavior identical; existing run tests define the contract.
+  (Blind hunter + acceptance auditor.)
+- **RESOLVED 2026-08-02 (D3) – CLI `corpus promote` exit code conflates
+  usage-error with infra.** Added `_RC_USAGE=4` for caller/usage errors (wrong
+  id, missing/corrupt corpus); `CorpusError` now maps to rc 4 (was rc 2). Genuine
+  `OSError` during read/write still maps to rc 2 (infra). Documented the now-5-
+  code taxonomy (0/1/2/3/4) in the cli.py module docstring. (Blind hunter +
+  acceptance auditor + edge-case hunter.)
+- **RESOLVED 2026-08-02 (D4) – corpus mutation is O(n) read-modify-write with
+  no file lock.** `_with_corpus_lock` (fcntl.flock LOCK_EX on `<path>.lock`)
+  wraps the read-modify-write in `add_entry` + `promote_entry`, serializing
+  concurrent writers (no lost update). `fcntl` is Unix-only; guarded with
+  try/except ImportError so non-Unix degrades to a no-op (project targets Linux).
+  (Blind hunter + edge-case hunter.)
 
 ## From the original Phase D checklist (docs/bmad/plans/phase-d-trial-checklist.md G3)
 

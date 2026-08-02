@@ -20,9 +20,15 @@ Honest exit-3 stubs (need external prerequisites the CLI cannot provide):
 * ``autopilot`` — is the AI autopilot skill; run via Claude Code, not the CLI.
   Exit 3.
 
-Exit-code convention: 0 = success; 1 = product failure (a scenario assertion
-failed); 2 = infra failure (collection error, usage error, no subcommand);
-3 = honestly needs an external host/agent (not a bug, not "not implemented").
+Exit-code convention (D3 introduces the 5th code, separating caller bugs
+from environment failures so a caller/script can tell "retry won't help"
+from "the environment broke"):
+
+* 0 = success
+* 1 = product failure (a scenario assertion failed)
+* 2 = infra failure (collection error, OSError on write, environment issue)
+* 3 = honestly needs an external host/agent (not a bug, not "not implemented")
+* 4 = usage error (caller bug: wrong id, missing corpus file — retrying won't help)
 """
 
 from __future__ import annotations
@@ -36,11 +42,16 @@ from pathlib import Path
 
 from testvibe import corpus, scaffold
 
-# Exit codes.
+# Exit codes — see the module docstring for the full 5-code taxonomy.
 _RC_SUCCESS = 0
 _RC_PRODUCT = 1
 _RC_INFRA = 2
 _RC_NEEDS_HOST_AGENT = 3
+# D3: a caller/usage error (wrong id, missing corpus file) is NOT an infra
+# failure — retrying the same command is useless. rc 4 distinguishes "caller
+# bug" from "the environment broke (rc 2)" so a script can decide whether to
+# retry or surface a user-facing "check your inputs" message.
+_RC_USAGE = 4
 
 # Default corpus path (relative to cwd) when --corpus is not given.
 _DEFAULT_CORPUS = "known-failures.yaml"
@@ -66,11 +77,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
     sys.stdout.write("\n")
     if report.passed:
         return _RC_SUCCESS
-    # A failure is product (rc 1) unless the only failure is infra.
-    kinds = {f.kind for f in report.failures}
-    if kinds == {"infra"} or (kinds and "product" not in kinds):
-        return _RC_INFRA
-    return _RC_PRODUCT
+    # run_scenarios adds AT MOST ONE Failure (single add_failure call, no loop),
+    # so the single-failure kind maps directly to the exit code. The former
+    # multi-kind set logic ({'infra'} or 'product' not in kinds) was dead code:
+    # it never had >1 failure to prioritize and reduced to the same mapping.
+    f = report.failures[0]
+    return _RC_INFRA if f.kind == "infra" else _RC_PRODUCT
 
 
 def _cmd_corpus_add(args: argparse.Namespace) -> int:
@@ -116,24 +128,43 @@ def _cmd_corpus_promote(args: argparse.Namespace) -> int:
     p = Path(args.corpus)
     # Find the entry by id via load_corpus (which filters to open/pinned — the
     # only statuses that can be promoted). A missing file or unknown id is a
-    # real caller bug, not a product signal.
+    # CALLER bug (rc _RC_USAGE, not infra): retrying the same command is
+    # useless because the inputs are wrong. Distinct from a genuine
+    # environment failure (OSError) which maps to _RC_INFRA (rc 2).
     try:
         entries = corpus.load_corpus(p)
     except corpus.CorpusError as e:
+        # A CorpusError here is a malformed corpus file (a caller handed us a
+        # bad path or edited the file into corruption): usage error, not infra.
         sys.stderr.write(f"testvibe: promote failed: {e}\n")
+        return _RC_USAGE
+    except OSError as e:
+        # A genuine environment failure (permissions, EROFS, IO error reading
+        # the path): infra, retrying or fixing the environment may help.
+        sys.stderr.write(f"testvibe: promote failed (infra): {e}\n")
         return _RC_INFRA
     target = next((e for e in entries if e.id == args.id), None)
     if target is None:
         sys.stderr.write(
             f"testvibe: entry id {args.id!r} not found in corpus {p}\n"
         )
-        return _RC_INFRA
+        return _RC_USAGE
     # Actually execute the repro. A still-failing repro means the bug is not
-    # fixed -> do NOT promote, return the product failure code.
+    # fixed -> do NOT promote, return the product failure code. The repro is
+    # loaded confined to the corpus dir (D1): add_entry stores it relative to
+    # the corpus dir, and confinement re-resolves it there so a stored relative
+    # path works regardless of the CLI's cwd.
     try:
-        repro_fn = corpus._load_repro(target.repro)
+        repro_fn = corpus._load_repro(target.repro, base=p.parent)
         repro_fn()
-    except Exception as e:  # any repro failure means not-green
+    except corpus.CorpusError as e:
+        # Confinement failure (repro escapes corpus dir) is a caller/usage
+        # error, not a product signal.
+        sys.stderr.write(
+            f"testvibe: repro for {args.id} cannot be loaded: {e}\n"
+        )
+        return _RC_USAGE
+    except Exception as e:  # any repro execution failure means not-green
         sys.stderr.write(
             f"testvibe: repro for {args.id} still fails; not promoted ({e})\n"
         )
@@ -141,7 +172,12 @@ def _cmd_corpus_promote(args: argparse.Namespace) -> int:
     try:
         entry = corpus.promote_entry(p, args.id, passes=True)
     except corpus.CorpusError as e:
+        # CorpusError from promote_entry = missing id/corpus (caller bug).
         sys.stderr.write(f"testvibe: promote failed: {e}\n")
+        return _RC_USAGE
+    except OSError as e:
+        # OSError during the atomic write = environment failure.
+        sys.stderr.write(f"testvibe: promote failed (infra): {e}\n")
         return _RC_INFRA
     sys.stdout.write(
         f"promoted corpus entry id={entry.id} -> status={entry.status}\n"

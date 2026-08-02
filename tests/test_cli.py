@@ -28,6 +28,7 @@ _RC_PASS = 0
 _RC_PRODUCT = 1
 _RC_INFRA = 2
 _RC_NEEDS_HOST_AGENT = 3
+_RC_USAGE = 4  # D3: caller/usage error (wrong id, missing corpus) — retrying won't help
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +137,8 @@ def test_cli_corpus_add_appends_row(tmp_path: pathlib.Path):
     assert len(entries) == 1
     assert entries[0].id == "bug-cli-1"
     assert entries[0].invariant == "push is idempotent"
-    assert entries[0].repro == str(repro)
+    # D1: repro stored relative to the corpus dir (colocated here).
+    assert entries[0].repro == "repro.py"
     assert entries[0].status == "open"
 
 
@@ -250,9 +252,113 @@ def test_cli_corpus_promote_unknown_id_is_nonzero(tmp_path: pathlib.Path, capsys
     rc = cli.main(
         ["corpus", "promote", "ghost", "--corpus", str(corpus)]
     )
-    # CorpusError -> CLI maps to _RC_INFRA (2), the tri-state boundary contract.
-    # Tightened from `!= _RC_PASS` so the exit code is actually verified.
+    # D3: a missing id is a CALLER/usage error (retrying won't help), distinct
+    # from an infra failure (rc 2). Map to _RC_USAGE (4), not _RC_INFRA.
+    assert rc == _RC_USAGE
+    # The message must still be emitted (caller can read what went wrong).
+    err = capsys.readouterr().err
+    assert "ghost" in err
+
+
+def test_cli_corpus_promote_missing_corpus_is_usage(tmp_path: pathlib.Path, capsys):
+    """promote on a corpus file that doesn't exist -> _RC_USAGE (caller error).
+
+    A missing corpus is the caller pointing at the wrong path — retrying the
+    same command is useless. Distinct from infra (rc 2).
+    """
+    from testvibe import cli
+
+    rc = cli.main(
+        [
+            "corpus", "promote", "anything",
+            "--corpus", str(tmp_path / "no-such.yaml"),
+        ]
+    )
+    assert rc == _RC_USAGE
+
+
+def test_cli_corpus_promote_oserror_is_infra(tmp_path: pathlib.Path, capsys, monkeypatch):
+    """A genuine OS error (e.g. write failure) during promote -> _RC_INFRA.
+
+    D3 draws the usage/infra line at the error TYPE: a CorpusError raised by
+    the promote path (missing id / missing corpus) is a caller bug (USAGE);
+    an OSError (disk full, permissions, EROFS) is an environment failure
+    (INFRA) — retrying or fixing the environment may help.
+    """
+    from testvibe import cli
+    from testvibe.corpus import CorpusEntry, add_entry
+    import testvibe.corpus as corpus_mod
+
+    repro = tmp_path / "repro.py"
+    repro.write_text("def repro():\n    return True\n")
+    corpus = tmp_path / "known-failures.yaml"
+    add_entry(
+        corpus,
+        CorpusEntry(
+            id="to-fix",
+            invariant="inv",
+            discovered_at="2026-08-02",
+            source="t",
+            repro=str(repro),
+            status="pinned",
+        ),
+    )
+
+    # Make _dump_corpus blow up with OSError to simulate an infra failure
+    # during the write half of promote.
+    def boom(*a, **kw):
+        raise OSError("simulated disk write failure")
+
+    monkeypatch.setattr(corpus_mod, "_dump_corpus", boom)
+    rc = cli.main(["corpus", "promote", "to-fix", "--corpus", str(corpus)])
     assert rc == _RC_INFRA
+
+
+def test_cli_corpus_promote_success_returns_zero(tmp_path: pathlib.Path):
+    """A clean green promote -> rc 0 (D3: still success among the new codes)."""
+    from testvibe import cli
+    from testvibe.corpus import CorpusEntry, add_entry, load_corpus
+
+    repro = tmp_path / "repro.py"
+    repro.write_text("def repro():\n    return True\n")
+    corpus = tmp_path / "known-failures.yaml"
+    add_entry(
+        corpus,
+        CorpusEntry(
+            id="now-fixed",
+            invariant="inv",
+            discovered_at="2026-08-02",
+            source="t",
+            repro=str(repro),
+            status="pinned",
+        ),
+    )
+    rc = cli.main(["corpus", "promote", "now-fixed", "--corpus", str(corpus)])
+    assert rc == _RC_PASS
+    assert load_corpus(corpus) == []  # fixed drops out of the active set
+
+
+def test_cli_corpus_promote_failing_repro_is_product(tmp_path: pathlib.Path):
+    """A still-failing repro -> rc PRODUCT (1), distinct from usage/infra."""
+    from testvibe import cli
+    from testvibe.corpus import CorpusEntry, add_entry
+
+    repro = tmp_path / "repro.py"
+    repro.write_text("def repro():\n    raise AssertionError('still broken')\n")
+    corpus = tmp_path / "known-failures.yaml"
+    add_entry(
+        corpus,
+        CorpusEntry(
+            id="still-broken",
+            invariant="inv",
+            discovered_at="2026-08-02",
+            source="t",
+            repro=str(repro),
+            status="pinned",
+        ),
+    )
+    rc = cli.main(["corpus", "promote", "still-broken", "--corpus", str(corpus)])
+    assert rc == _RC_PRODUCT
 
 
 # ---------------------------------------------------------------------------
@@ -409,16 +515,6 @@ def test_cli_corpus_promote_passing_repro_promotes(
     assert rc == _RC_PASS
     # fixed drops out of the active quarantine set.
     assert load_corpus(corpus) == []
-
-
-def test_cli_corpus_promote_missing_corpus_is_infra(tmp_path: pathlib.Path, capsys):
-    """promote on a corpus file that doesn't exist -> rc 2 (infra), not product."""
-    from testvibe import cli
-
-    rc = cli.main(
-        ["corpus", "promote", "x", "--corpus", str(tmp_path / "no-such.yaml")]
-    )
-    assert rc == _RC_INFRA
 
 
 # ---------------------------------------------------------------------------

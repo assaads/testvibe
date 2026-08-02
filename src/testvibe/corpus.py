@@ -25,6 +25,17 @@ from pathlib import Path
 
 import yaml
 
+# fcntl is Unix-only (POSIX advisory file locking). The project targets Linux
+# (the CI gate runs on Linux; dogfood.py already reads /proc). Guard the import
+# so the module still imports on non-Unix (e.g. Windows dev boxes): when fcntl
+# is unavailable, _with_corpus_lock degrades to a no-op context manager. The
+# lock is only meaningful for concurrent mutation, which is a server/CI concern
+# — single-user local runs are unaffected.
+try:
+    import fcntl  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover — non-Unix path; the test suite runs on Linux
+    fcntl = None  # type: ignore[assignment]
+
 
 @dataclass
 class CorpusEntry:
@@ -112,9 +123,41 @@ def load_corpus(path) -> list[CorpusEntry]:
     return entries
 
 
-def _load_repro(repro_path):
-    """Import ``repro_path`` from disk and return its ``repro`` callable."""
+def _resolve_confined(repro_path, base) -> Path:
+    """Resolve ``repro_path`` and confirm it lives inside ``base``.
+
+    Confinement is the security property that stops a caller-supplied repro
+    path (e.g. ``/tmp/evil.py`` or a symlink pointing outside the corpus dir)
+    from being executed by :func:`_load_repro`. A relative path is resolved
+    against ``base``; an absolute path must already be under ``base``; symlinks
+    are followed (:meth:`Path.resolve`) so a link inside ``base`` that points
+    outside is rejected too.
+
+    Returns the resolved absolute path when confined. Raises
+    :class:`CorpusError` when the resolved path escapes ``base`` — never
+    executes the file.
+    """
     rp = Path(repro_path)
+    base_resolved = Path(base).resolve()
+    resolved = rp.resolve() if rp.is_absolute() else (base_resolved / rp).resolve()
+    if resolved != base_resolved and not resolved.is_relative_to(base_resolved):
+        raise CorpusError(
+            f"repro path {rp!s} escapes confinement base {base_resolved!s} "
+            f"(resolved to {resolved!s}); repros must live under the corpus dir"
+        )
+    return resolved
+
+
+def _load_repro(repro_path, *, base=None):
+    """Import ``repro_path`` from disk and return its ``repro`` callable.
+
+    When ``base`` is given, the repro path is confined to ``base`` via
+    :func:`_resolve_confined` BEFORE it is imported — an escaping path raises
+    :class:`CorpusError` and is never executed (the security property). When
+    ``base`` is ``None`` the path is loaded unconfined (backward compatibility
+    for direct callers and legacy tests that do not supply a base).
+    """
+    rp = Path(repro_path) if base is None else _resolve_confined(repro_path, base)
     spec = importlib.util.spec_from_file_location(rp.stem, rp)
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None  # for type-checkers; spec_from_file_location sets a loader
@@ -204,6 +247,46 @@ def _load_raw_rows(path: Path) -> list[dict]:
     return list(raw)
 
 
+@contextlib.contextmanager
+def _with_corpus_lock(path):
+    """Exclusive advisory lock around a corpus read-modify-write cycle.
+
+    Opens ``<path>.lock`` beside the corpus file and takes ``LOCK_EX`` on it
+    for the duration of the ``with`` block, serializing concurrent
+    ``add_entry`` / ``promote_entry`` calls so a second writer cannot read a
+    stale row list between the first writer's load and dump (the lost-update
+    race). Released on block exit (including via exception).
+
+    On non-Unix (no :mod:`fcntl`) this is a no-op: locking is a server/CI
+    concern and single-user local runs are unaffected. The lockfile is left on
+    disk after release (it is a 0-byte sidecar; deleting it under contention
+    would risk a race where another process holds the fd but the file is
+    unlinked — leaving the lock effective but the path orphaned).
+
+    Yields nothing; the body runs under the lock.
+    """
+    if fcntl is None:
+        # Non-Unix: no advisory locking available. Degrade to unlocked.
+        yield
+        return
+    lock_path = str(path) + ".lock"
+    # Ensure the parent dir exists so open() doesn't FileNotFoundError on a
+    # fresh corpus dir (the body's _dump_corpus would mkdir anyway, but the
+    # lock must open first).
+    Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
+    # The fd is held open for the duration of the with-block; LOCK_EX blocks
+    # until the lock is available. Closing the fd on exit releases the lock
+    # (the kernel frees the advisory lock when the last fd is closed).
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def add_entry(path, entry: CorpusEntry) -> CorpusEntry:
     """Append ``entry`` to the corpus at ``path`` and persist it.
 
@@ -232,20 +315,52 @@ def add_entry(path, entry: CorpusEntry) -> CorpusEntry:
             f"(pytest-safe identifier; quarantine test names are derived from it)"
         )
     p = Path(path)
-    rows = _load_raw_rows(p)
-    # Reject duplicate ids: a second row with an existing id creates duplicate
-    # pytest test names and zombie pins (promote matches only the first).
-    for row in rows:
-        if row.get("id") == entry.id:
-            raise CorpusError(
-                f"duplicate id {entry.id!r}: an entry with this id already exists "
-                f"in {p}"
-            )
-    # Derive the row from the dataclass so a new CorpusEntry field can never be
-    # silently dropped on write (round-trip break). Hand-building a 6-key dict
-    # would drift if CorpusEntry gains a field.
-    rows.append(dataclasses.asdict(entry))
-    _dump_corpus(p, rows)
+    # Confinement at WRITE time: a repro that resolves outside the corpus dir
+    # must never round-trip into known-failures.yaml (it would execute outside
+    # code on every collection). Resolve + check against the corpus dir, then
+    # store the repro RELATIVE to the corpus dir when it lives there (so it
+    # re-resolves confined on reload). An escaping repro raises CorpusError
+    # before any read-modify-write begins, so nothing is written.
+    corpus_dir = p.resolve().parent
+    repro_path = Path(entry.repro)
+    repro_resolved = repro_path.resolve()
+    if repro_resolved != corpus_dir and not repro_resolved.is_relative_to(corpus_dir):
+        raise CorpusError(
+            f"repro path {entry.repro!r} escapes corpus dir {corpus_dir!s} "
+            f"(resolved to {repro_resolved!s}); repros must live alongside the corpus"
+        )
+    # Store relative when the repro is under the corpus dir (the common case) so
+    # the stored path is portable and re-resolves confined on reload. An
+    # absolute path already under the corpus dir is relativized too.
+    stored_repro = str(
+        repro_resolved.relative_to(corpus_dir)
+        if repro_resolved.is_relative_to(corpus_dir)
+        else repro_resolved
+    )
+    # The read-modify-write cycle runs under an exclusive lock (D4) so two
+    # concurrent add_entry calls cannot interleave their load/dump and lose a
+    # row (last-writer-wins). The confinement + status + charset checks above
+    # are pure validations that do not touch the file, so they stay outside the
+    # lock (fail fast, never acquire the lock for an invalid entry).
+    with _with_corpus_lock(p):
+        rows = _load_raw_rows(p)
+        # Reject duplicate ids: a second row with an existing id creates duplicate
+        # pytest test names and zombie pins (promote matches only the first).
+        for row in rows:
+            if row.get("id") == entry.id:
+                raise CorpusError(
+                    f"duplicate id {entry.id!r}: an entry with this id already exists "
+                    f"in {p}"
+                )
+        # Derive the row from the dataclass so a new CorpusEntry field can never
+        # be silently dropped on write (round-trip break). Hand-building a 6-key
+        # dict would drift if CorpusEntry gains a field. Override the stored
+        # repro with the relativized form so the persisted row re-resolves
+        # confined on reload.
+        row = dataclasses.asdict(entry)
+        row["repro"] = stored_repro
+        rows.append(row)
+        _dump_corpus(p, rows)
     return entry
 
 
@@ -267,49 +382,60 @@ def promote_entry(path, entry_id: str, *, passes: bool) -> CorpusEntry:
     Promoting an already-fixed entry is idempotent (returns it unchanged).
     """
     p = Path(path)
-    rows = _load_raw_rows(p)
-    if not p.exists():
-        raise CorpusError(f"corpus file not found: {p}")
-    target: dict | None = None
-    for row in rows:
-        if row.get("id") == entry_id:
-            target = row
-            break
-    if target is None:
-        raise CorpusError(
-            f"entry id {entry_id!r} not found in corpus {p}"
+    # The read-modify-write cycle runs under an exclusive lock (D4) so a
+    # concurrent add_entry/promote_entry cannot interleave. The missing-file
+    # check (p.exists()) is done INSIDE the lock so a concurrent writer that
+    # creates the file mid-cycle is observed consistently.
+    with _with_corpus_lock(p):
+        if not p.exists():
+            raise CorpusError(f"corpus file not found: {p}")
+        rows = _load_raw_rows(p)
+        target: dict | None = None
+        for row in rows:
+            if row.get("id") == entry_id:
+                target = row
+                break
+        if target is None:
+            raise CorpusError(
+                f"entry id {entry_id!r} not found in corpus {p}"
+            )
+        if passes:
+            target["status"] = "fixed"
+            _dump_corpus(p, rows)
+        return CorpusEntry(
+            id=target["id"],
+            invariant=target.get("invariant", ""),
+            discovered_at=target.get("discovered_at", ""),
+            source=target.get("source", ""),
+            repro=target.get("repro", ""),
+            status=target["status"],
         )
-    if passes:
-        target["status"] = "fixed"
-        _dump_corpus(p, rows)
-    return CorpusEntry(
-        id=target["id"],
-        invariant=target.get("invariant", ""),
-        discovered_at=target.get("discovered_at", ""),
-        source=target.get("source", ""),
-        repro=target.get("repro", ""),
-        status=target["status"],
-    )
 
 
-def quarantine_tests_for(entries):
+def quarantine_tests_for(entries, *, base=None):
     """Build the list of ``(test_name, repro_callable, status)`` tuples.
 
     ``test_name`` is a pytest-safe identifier derived from the entry id
     (``-`` -> ``_``). The repro callable is loaded eagerly so a missing or
     malformed repro surfaces at collection time rather than mid-run.
 
+    When ``base`` is given, each repro is confined to ``base`` via
+    :func:`_load_repro` before it is imported — an escaping path is skipped
+    (treated like any other unloadable repro) rather than executed, so a
+    malicious/confused entry cannot run code outside the corpus dir. The
+    plugin passes the corpus file's parent dir as ``base``.
+
     A single broken repro (missing file, ``AttributeError`` for no ``repro``
-    attribute, ``SyntaxError`` in the module) does NOT abort collection of the
-    other quarantine items: that entry is skipped and a warning is written to
-    stderr naming the id + reason. This honors the corpus.py docstring promise
-    that "a broken corpus degrades to a skipped quarantine set instead of
-    aborting the whole run."
+    attribute, ``SyntaxError`` in the module, confinement failure) does NOT
+    abort collection of the other quarantine items: that entry is skipped and
+    a warning is written to stderr naming the id + reason. This honors the
+    corpus.py docstring promise that "a broken corpus degrades to a skipped
+    quarantine set instead of aborting the whole run."
     """
     tests = []
     for e in entries:
         try:
-            repro = _load_repro(e.repro)
+            repro = _load_repro(e.repro, base=base)
         except Exception as ex:  # any load failure skips this entry
             sys.stderr.write(
                 f"testvibe: skipping quarantine entry {e.id!r}: "
