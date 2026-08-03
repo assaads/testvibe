@@ -35,6 +35,18 @@ Each is real; none were silently dropped.
 
 ## From the original Phase D checklist (docs/bmad/plans/phase-d-trial-checklist.md G3)
 
-- **Embedded GitHub PAT in `origin` remote URL** — `git remote -v` leaks a valid
-  `ghp_…`. Rotate and move to a credential helper / SSH remote. (Security item;
-  tracked in project memory `testvibe-remote-embedded-pat`.)
+- **PARTIALLY RESOLVED 2026-08-03 (D5) — Embedded GitHub PAT in `origin` remote URL.**
+  Local half done: `remote.origin.url` rewritten from
+  `https://ghp_30qiSf…@github.com/assaads/testvibe` to the token-free
+  `https://github.com/assaads/testvibe.git` (verified: `.git/config` has no `ghp_`
+  token). The token was confirmed to live ONLY in local `.git/config` — never in
+  git history or tracked files — so no history rewrite (BFG/filter-repo) was
+  needed. A global `credential.helper=store` supplies credentials at runtime
+  (from `~/.git-credentials`, mode 0600), never embedded in the URL.
+  **PENDING (human action — cannot be automated):** the exposed token
+  `ghp_30qiSf…` MUST be rotated/revoked in GitHub (Settings → Developer settings
+  → Personal access tokens). `~/.git-credentials` still holds the old token and
+  will be rejected after rotation; the next `git push` will prompt for the new
+  token. Scrubbing the URL without rotation is not sufficient — the token is
+  already exposed. (Security item; tracked in project memory
+  `testvibe-remote-embedded-pat`.)
